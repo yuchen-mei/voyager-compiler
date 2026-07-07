@@ -150,6 +150,7 @@ def pad_matrix_op_dimensions(
     model: GraphModule,
     C_unroll,
     K_unroll,
+    pad_terminal_output=True,
 ) -> GraphModule:
     """
     Pad inputs and weights to conv2d nodes in a torch.fx.GraphModule so that
@@ -160,6 +161,13 @@ def pad_matrix_op_dimensions(
         model (torch.fx.GraphModule): The FX graph module to transform.
         C_unroll (int): Unroll factor for the input channels (C_in).
         K_unroll (int): Unroll factor for the output channels (C_out).
+        pad_terminal_output (bool): Whether to pad C_out of a GEMM that feeds
+            straight into the graph output. Voyager's units emit K_unroll-wide
+            lanes, so an unaligned C_out (e.g. a ``num_labels`` classifier head)
+            is padded then sliced back off. Backends with no output-lane
+            constraint (e.g. agate's CGRA) pass ``False`` to keep the true width
+            and drop the pad + slice. Terminal only: a non-terminal output still
+            feeds a downstream op that may need alignment.
 
     Returns:
         torch.fx.GraphModule: The transformed FX graph module.
@@ -211,6 +219,14 @@ def pad_matrix_op_dimensions(
 
         if is_dw:
             pad_K = pad_C
+        elif (
+            pad_K
+            and not pad_terminal_output
+            and all(user.op == "output" for user in node.users)
+        ):
+            # Terminal GEMM, no output-lane constraint: keep true C_out and skip
+            # the K_unroll pad + cancelling slice. Safe: nothing downstream.
+            pad_K = 0
 
         # Pad weight along K and C dimensions
         if pad_C or pad_K:

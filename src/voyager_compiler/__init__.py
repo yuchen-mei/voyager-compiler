@@ -133,7 +133,8 @@ def transform(
     fuse_operator=True,
     fuse_reshape=True,
     split_spmm=False,
-    use_fake_mode=True
+    use_fake_mode=True,
+    pad_terminal_output=True,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -166,7 +167,9 @@ def transform(
     # Pad dimensions to align with hardware unrolling constraints (SIMD, systolic
     # array dimensions, etc.) to ensure efficient execution.
     if unroll_dims is not None:
-        pad_matrix_op_dimensions(model, *unroll_dims)
+        pad_matrix_op_dimensions(
+            model, *unroll_dims, pad_terminal_output=pad_terminal_output
+        )
         pad_vector_op_dimensions(model, unroll_dims[1])
 
     # -------------------------------------------------------------------------
