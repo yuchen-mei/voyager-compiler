@@ -120,10 +120,12 @@ def compute_tensor_size(
             logger.debug(f"Increase memory for softmax input {node} by 2x")
             return tensor_size * 2
 
-        if _find_user_with_target(
-            node, torch.ops.aten.layer_norm.default
-        ) or _find_user_with_target(node, torch.ops.aten.rms_norm.default):
-            logger.debug(f"Increase memory for norm input {node} by 2x")
+        if (
+            _find_user_with_target(node, torch.ops.aten.layer_norm.default)
+            or _find_user_with_target(node, torch.ops.aten.rms_norm.default)
+            or _find_user_with_target(node, torch.ops.quantized_ops.rope.default)
+        ):
+            logger.debug(f"Increase memory for norm/rope input {node} by 2x")
             return (tensor_size + numel) * 2
 
         return tensor_size

@@ -942,6 +942,7 @@ def run_submod_l2_tiling(
             torch.ops.aten.softmax.int,
             torch.ops.aten.layer_norm.default,
             torch.ops.aten.rms_norm.default,
+            torch.ops.quantized_ops.rope.default,
             torch.ops.quantized_ops.calculate_mx_qparam.default,
             torch.ops.quantized_ops.quantize_mx.default,
         ]

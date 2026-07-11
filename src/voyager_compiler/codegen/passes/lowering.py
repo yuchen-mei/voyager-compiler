@@ -30,6 +30,7 @@ __all__ = [
     "convert_expand_to_memory_copy",
     "replace_interpolate",
     "replace_rmsnorm_with_rms_norm",
+    "replace_rope_cluster",
     "replace_conv2d_with_im2col",
     "extract_input_preprocessor",
     "rewrite_fx_graph",
@@ -639,6 +640,69 @@ def replace_rmsnorm_with_rms_norm(
                 torch.ops.aten.rms_norm.default,
                 tuple(rms_norm_inputs),
                 {}
+            )
+
+        output_node.replace_all_uses_with(new_node)
+        original_graph.erase_node(output_node)
+
+        new_node.meta = output_node.meta
+
+    original_graph.lint()
+    original_graph.eliminate_dead_code()
+    model.recompile()
+
+
+def replace_rope_cluster(model, example_inputs, convert_scalars_to_attrs=False):
+    """Collapse the apply_rotary_pos_emb cluster into a single quantized_ops.rope op.
+
+    Agate lowers rope to the one-pass rope_bf16 CGRA kernel, so the traced graph
+    must compute the rotation as one op. The pattern is (x, cos, sin) ->
+    x * cos + rotate_half(x) * sin; it matches both the query and key clusters
+    (which share the unsqueezed cos/sin). example_inputs are (x, cos, sin) example
+    tensors -- x's last dim must be the real head_dim so the rotate_half slice
+    bounds match the graph.
+    """
+
+    class _RopeApply(torch.nn.Module):
+        def forward(self, x, cos, sin):
+            half = x.shape[-1] // 2
+            x1 = x[..., :half]
+            x2 = x[..., half:]
+            rot = torch.cat((-x2, x1), dim=-1)
+            return x * cos + rot * sin
+
+    original_graph = model.graph
+    pattern = get_aten_graph_module(_RopeApply(), example_inputs)
+    if convert_scalars_to_attrs:
+        _convert_scalars_to_attrs(pattern)
+    pattern_graph = pattern.graph
+
+    matcher = SubgraphMatcher(
+        pattern_graph,
+        match_output=False,
+        match_placeholder=False,
+        remove_overlapping_matches=True,
+        ignore_literals=False,
+    )
+    _matches: List[InternalMatch] = matcher.match(original_graph)
+    logger.info(f"Found {len(_matches)} rope matches")
+
+    # Pattern placeholders are in forward-arg order: (x, cos, sin).
+    pattern_placeholders = [
+        node for node in pattern_graph.nodes if node.op == "placeholder"
+    ]
+
+    for match in _matches:
+        input_node, cos_node, sin_node = (
+            match.nodes_map[placeholder] for placeholder in pattern_placeholders
+        )
+        output_node = match.returning_nodes[0]
+
+        with original_graph.inserting_before(output_node):
+            new_node = original_graph.call_function(
+                torch.ops.quantized_ops.rope.default,
+                (input_node, cos_node, sin_node),
+                {},
             )
 
         output_node.replace_all_uses_with(new_node)

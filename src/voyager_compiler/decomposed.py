@@ -124,6 +124,28 @@ def layer_norm(
     return output
 
 
+quantized_decomposed_lib.define(
+    "rope(Tensor input, Tensor cos, Tensor sin) -> Tensor"
+)
+
+
+@impl(quantized_decomposed_lib, "rope", "CompositeExplicitAutograd")
+def rope(
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    # Rotary position embedding: out = x * cos + rotate_half(x) * sin, with no
+    # mean/reduction -- rotate_half negates the upper head-dim half and swaps it
+    # with the lower half. Agate lowers this single op to the rope_bf16 CGRA
+    # kernel, whose per-lane math is algebraically identical.
+    half = input.shape[-1] // 2
+    x1 = input[..., :half]
+    x2 = input[..., half:]
+    rotate_half = torch.cat((-x2, x1), dim=-1)
+    return input * cos + rotate_half * sin
+
+
 def expand(input, shape, block_size):
     while input.ndim < len(shape):
         input = input.unsqueeze(0)
