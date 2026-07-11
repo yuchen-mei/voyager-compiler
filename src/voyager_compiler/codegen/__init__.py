@@ -27,7 +27,7 @@ __all__ = [
     "rename_nodes_with_param_names",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
-    "replace_rmsnorm_with_layer_norm",
+    "replace_rmsnorm_with_rms_norm",
     "rewrite_fx_graph",
     "run_memory_mapping",
     "run_matrix_op_l2_tiling",

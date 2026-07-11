@@ -1454,6 +1454,7 @@ def run_vector_op_node_l2_tiling(
     if not is_elementwise_op(node) and node.target not in [
         torch.ops.aten.softmax.int,
         torch.ops.aten.layer_norm.default,
+        torch.ops.aten.rms_norm.default,
         torch.ops.aten.permute.default,
         torch.ops.aten.transpose.int,
         torch.ops.quantized_ops.layer_norm.default,

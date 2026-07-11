@@ -29,7 +29,7 @@ __all__ = [
     "convert_cat_with_mismatched_shapes_to_stack",
     "convert_expand_to_memory_copy",
     "replace_interpolate",
-    "replace_rmsnorm_with_layer_norm",
+    "replace_rmsnorm_with_rms_norm",
     "replace_conv2d_with_im2col",
     "extract_input_preprocessor",
     "rewrite_fx_graph",
@@ -594,17 +594,22 @@ def replace_interpolate():
     torch.nn.functional.interpolate = torch.ops.custom.interpolate
 
 
-def replace_rmsnorm_with_layer_norm(
+def replace_rmsnorm_with_rms_norm(
     model: GraphModule,
-    layer_norm: torch.nn.Module,
+    rms_norm: torch.nn.Module,
     example_input,
     convert_scalars_to_attrs=False,
 ):
-    """Replace LLaMA RMSNorm with ATen layer_norm
+    """Replace LLaMA RMSNorm with ATen rms_norm.
+
+    Agate lowers this to a single fused reduce-normalize-scale CGRA kernel, so the
+    traced graph must COMPUTE rms_norm (x / sqrt(mean(x^2) + eps) * weight, with no
+    mean subtraction) -- not layer_norm -- for the dumped reference tensor to match
+    the hardware result.
     """
     original_graph = model.graph
 
-    pattern = get_aten_graph_module(layer_norm, example_input)
+    pattern = get_aten_graph_module(rms_norm, example_input)
     if convert_scalars_to_attrs:
         _convert_scalars_to_attrs(pattern)
     pattern_graph = pattern.graph
@@ -620,18 +625,19 @@ def replace_rmsnorm_with_layer_norm(
     logger.info(f"Found {len(_matches)} matches")
 
     weight_node = next(iter(n for n in pattern_graph.nodes if n.target == "weight"))
+    eps = getattr(rms_norm, "variance_epsilon", 1e-6)
 
     for match in _matches:
         input_node = match.placeholder_nodes[0]
         output_node = match.returning_nodes[0]
         input_shape = input_node.meta["val"].shape
         new_weight_node = match.nodes_map[weight_node]
-        layer_norm_inputs = [input_node, [input_shape[-1]], new_weight_node]
+        rms_norm_inputs = [input_node, [input_shape[-1]], new_weight_node, eps]
 
         with original_graph.inserting_before(output_node):
             new_node = original_graph.call_function(
-                torch.ops.aten.layer_norm.default,
-                tuple(layer_norm_inputs),
+                torch.ops.aten.rms_norm.default,
+                tuple(rms_norm_inputs),
                 {}
             )
 

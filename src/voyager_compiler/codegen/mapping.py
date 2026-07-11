@@ -110,6 +110,7 @@ OP_PARAM_ARG_INDEX = {
     torch.ops.aten.conv2d.default: 1,
     torch.ops.aten.linear.default: 1,
     torch.ops.aten.layer_norm.default: 2,
+    torch.ops.aten.rms_norm.default: 2,
     torch.ops.quantized_ops.conv2d.default: 1,
     torch.ops.quantized_ops.linear.default: 1,
     torch.ops.quantized_ops.conv2d_mx.default: 1,
@@ -622,6 +623,7 @@ def _fuse_dequantize_recursive(
         or is_elementwise_op(current_node)
         or current_node.target in [
             torch.ops.aten.layer_norm.default,
+            torch.ops.aten.rms_norm.default,
             torch.ops.aten.softmax.int,
         ]
     ):
@@ -939,6 +941,7 @@ def run_submod_l2_tiling(
         first_node.target not in [
             torch.ops.aten.softmax.int,
             torch.ops.aten.layer_norm.default,
+            torch.ops.aten.rms_norm.default,
             torch.ops.quantized_ops.calculate_mx_qparam.default,
             torch.ops.quantized_ops.quantize_mx.default,
         ]
