@@ -39,12 +39,25 @@ def _shared_exponents(A, method="max", axes=None, ebits=0):
     else:
         raise Exception("Unrecognized shared exponent selection method %s" % (method))
 
-    # log2(shared_exp) and truncate to integer
+    # log2(shared_exp) and truncate to integer.
+    #
+    # Do the log2 in float32. The block amax arrives in the working dtype (bf16
+    # for MX activations), and torch.log2 in bf16 rounds a top-of-binade value
+    # such as log2(7.96875) = 2.994 up to 3.0, so floor() returns 3 instead of 2
+    # -- an effective ceil at the largest mantissa. The hardware get-scale PE
+    # reads the bf16 exponent field directly (a true floor), so floor log2 in
+    # float32 to match it and keep the shared exponent bit-consistent with the
+    # CGRA (otherwise a block whose amax is the top bf16 rung below a power of
+    # two picks a scale 2x too large, and every element saturates 2x on device).
+    in_dtype = shared_exp.dtype
     shared_exp = torch.floor(
         torch.log2(
-            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+            (
+                shared_exp
+                + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+            ).float()
         )
-    )
+    ).to(in_dtype)
 
     # Restrict to [-emax, emax] range
     if ebits > 0:
