@@ -840,6 +840,85 @@ def _make_tiled_linear_with_outlier_filter_module(
     return WrapperModule(forward)
 
 
+def _gemm_output_residual_add(node):
+    """Return ``(add_node, residual_operand)`` for a residual add on ``node``'s
+    output, or ``None``.
+
+    Searches ``node``'s forward users for an ``aten.add.Tensor`` with two tensor
+    operands and returns it together with the operand not derived from ``node``.
+    Returns ``None`` if none is found or if the add's result feeds a quantize.
+    """
+
+    def _from_node(candidate, depth=4):
+        cur = candidate
+        for _ in range(depth):
+            if cur is node:
+                return True
+            inputs = cur.all_input_nodes
+            if not inputs:
+                return False
+            cur = inputs[0]
+        return cur is node
+
+    seen = set()
+    frontier = list(node.users)
+    for _ in range(4):
+        following = []
+        for user in frontier:
+            if user in seen:
+                continue
+            seen.add(user)
+            if user.target == torch.ops.aten.add.Tensor:
+                operands = list(user.all_input_nodes)
+                residual = [op for op in operands if not _from_node(op)]
+                if len(operands) == 2 and len(residual) == 1:
+                    feeds_quantize = any(
+                        "quantize"
+                        in (getattr(c.target, "__name__", "") or str(c.target))
+                        for c in user.users
+                    )
+                    return None if feeds_quantize else (user, residual[0])
+            following.extend(user.users)
+        frontier = following
+    return None
+
+
+def _seed_reduction_with_residual(model, gm, value_remap, residual_info):
+    """Add ``residual`` onto the first tile of the C-tiled reduction and drop the
+    trailing residual add.
+
+    Inserts ``first_tile_output + residual`` as the reduction's initial value so the
+    accumulated sum already includes the residual, then removes the original
+    trailing add and rewires its users to the reduction output. No-op if the tiled
+    module has no accumulate add.
+    """
+    add_node, residual = residual_info
+    module_add = next(
+        (
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.add.Tensor
+        ),
+        None,
+    )
+    if module_add is None or module_add not in value_remap:
+        return
+    inlined_add = value_remap[module_add]
+    seed_target = inlined_add.args[0]  # first C-tile's MatrixUnit output
+    next_tile = inlined_add.args[1]  # second C-tile; the accumulate fuses onto it
+    with model.graph.inserting_before(next_tile):
+        seed = model.graph.call_function(
+            torch.ops.aten.add.Tensor, (seed_target, residual)
+        )
+    propagate_shape(seed, model)
+    seed.meta["dtype"] = seed_target.meta.get("dtype")
+    inlined_add.replace_input_with(seed_target, seed)
+    # The reduction now already includes the residual; drop the trailing add.
+    proj_operand = add_node.args[0] if add_node.args[1] is residual else add_node.args[1]
+    add_node.replace_all_uses_with(proj_operand)
+    model.graph.erase_node(add_node)
+
+
 def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     """
     Transform a GEMM node (matmul/linear) into a tiled version along the
@@ -877,6 +956,10 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
         node.meta["l2_tiling"] = tiling
         node.meta["tile_strides"] = tile_strides
         return
+
+    # Capture any residual add now, before the node is replaced, so it can be seeded
+    # into the reduction after tiling (see _seed_reduction_with_residual).
+    residual_info = _gemm_output_residual_add(node)
 
     def load_arg(a):
         return map_arg(a, lambda n: n.value if isinstance(n, Node) else n)
@@ -959,6 +1042,9 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
                 "l2_tiling": tiling,
                 "dtype": node.meta.get("dtype"),
             })
+
+    if residual_info is not None and A_data is None:
+        _seed_reduction_with_residual(model, gm, value_remap, residual_info)
 
 
 def get_valid_tiling(
