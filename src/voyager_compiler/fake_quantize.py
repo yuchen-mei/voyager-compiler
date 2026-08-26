@@ -29,7 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 def get_quantization_map(dtype, device=None):
-    """Return a quantization map for the given dtype."""
+    """Build the BF16 lookup table used by fake-quant and lowered quantize ops.
+
+    ``FusedAmaxObsFakeQuantize`` calls this with the requested logical dtype and
+    optional Torch device. The returned table contains one quantized BF16 value
+    for every BF16 bit pattern; integer INT16 entries follow the CGRA
+    ``fp_getfint`` conversion and truncate in-range values toward zero.
+    """
     values = torch.arange(2 ** 16, dtype=torch.int16, device=device).view(torch.bfloat16)
     if dtype is None:
         return values
@@ -43,6 +49,11 @@ def get_quantization_map(dtype, device=None):
     if (match := re.fullmatch(r'int(\d+)', dtype, re.IGNORECASE)):
         nbits = int(match.group(1))
         quant_min, quant_max = -2 ** (nbits - 1), 2 ** (nbits - 1) - 1
+        if nbits == 16:
+            # The CGRA implements BF16-to-INT16 quantization with fp_getfint,
+            # whose in-range conversion truncates toward zero. Per-tensor
+            # scaling keeps the converted activation within the INT16 range.
+            return torch.trunc(values)
         return torch.clamp(torch.round(values), quant_min, quant_max)
 
     # Unsigned integer
