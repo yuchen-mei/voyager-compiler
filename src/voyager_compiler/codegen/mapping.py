@@ -50,10 +50,7 @@ DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
 
 
 def replace_node_with_graph_module(
-    gm: GraphModule,
-    source: Node,
-    replacement: GraphModule,
-    value_remap=None
+    gm: GraphModule, source: Node, replacement: GraphModule, value_remap=None
 ) -> List[Node]:
     if value_remap is None:
         value_remap = {}
@@ -62,9 +59,9 @@ def replace_node_with_graph_module(
     output = None
 
     for node in list(replacement.graph.nodes):
-        if node.op == 'placeholder':
+        if node.op == "placeholder":
             value_remap[node] = next(args_iter, None)
-        elif node.op == 'output':
+        elif node.op == "output":
             output = node.args[0]
             if len(output) == 1:
                 source.replace_all_uses_with(value_remap[output[0]])
@@ -75,19 +72,39 @@ def replace_node_with_graph_module(
                     user.replace_all_uses_with(value_remap[output[idx]])
         else:
             with gm.graph.inserting_before(source):
-                if node.op == 'get_attr':
+                if node.op == "get_attr":
                     param = fetch_attr(replacement, node.target)
                     value_remap[node] = create_getattr_from_value(
                         gm, gm.graph, "_tensor_constant_", param
                     )
                 else:
-                    value_remap[node] = gm.graph.node_copy(node, lambda n: value_remap[n])
+                    value_remap[node] = gm.graph.node_copy(
+                        node, lambda n: value_remap[n]
+                    )
                 propagate_shape(value_remap[node], gm)
 
     return [value_remap[n] for n in output]
 
 
 def _create_subgraph(nodes: List[Node]):
+    """Copy a fusion candidate into a self-contained FX graph module.
+
+    ``fuse_operator`` calls this after it has selected a sequential group of
+    reshape, MatrixUnit, and/or elementwise nodes. Inputs produced outside the
+    group become placeholders and are returned as the outer call arguments.
+    Placeholders retain ``source_node`` links to their parent-graph operands.
+    Internal nodes instead copy their eager ``value`` and ``shape`` attributes;
+    this preserves the result of layout propagation even when the copied node
+    is a dtype-specific clone whose shape differs from its original template.
+
+    Args:
+        nodes: Topologically ordered FX nodes that form one fusion group.
+
+    Returns:
+        A pair containing the new ``GraphModule`` and the original external
+        input nodes in placeholder order. The caller installs the module and
+        creates the corresponding ``call_module`` node in the parent graph.
+    """
     new_args = []
     new_graph = torch.fx.Graph()
     value_remap = {}
@@ -97,8 +114,12 @@ def _create_subgraph(nodes: List[Node]):
             if n not in value_remap:
                 value_remap[n] = new_graph.placeholder(n.name)
                 new_args.append(n)
-                value_remap[n].meta['source_node'] = n
-        value_remap[node] = new_graph.node_copy(node, lambda n : value_remap[n])
+                value_remap[n].meta["source_node"] = n
+        value_remap[node] = new_graph.node_copy(node, lambda n: value_remap[n])
+        if hasattr(node, "value"):
+            value_remap[node].value = node.value
+        if hasattr(node, "shape"):
+            value_remap[node].shape = node.shape
 
     new_graph.output(value_remap[nodes[-1]])
     new_graph.lint()
@@ -129,7 +150,7 @@ def get_unique_node_name(node: Node):
         while weight_node.target == torch.ops.aten.slice.Tensor:
             weight_node = weight_node.args[0]
 
-        if weight_node.op == 'get_attr':
+        if weight_node.op == "get_attr":
             return weight_node.name.split("_weight")[0]
 
     return node.name
@@ -169,7 +190,7 @@ def get_submodule_name(module, nodes: List[Node]):
                 first_node = n
                 break
             if (
-                n.op == 'call_function'
+                n.op == "call_function"
                 and not is_nop(n)
                 and not is_reshape_op(n)
                 and (
@@ -213,15 +234,14 @@ def _create_and_insert_subgraph(
     setattr(model, node_name, submodule)
     named_modules[node_name] = submodule
     with model.graph.inserting_after(nodes[-1]):
-        new_node = model.graph.create_node(
-            'call_module', node_name, new_args, {})
+        new_node = model.graph.create_node("call_module", node_name, new_args, {})
     nodes[-1].replace_all_uses_with(new_node)
     for node in reversed(nodes):
         if not node.users:
             model.graph.erase_node(node)
-    new_node.meta['submodule'] = submodule
-    if (dtype := nodes[-1].meta.get('dtype', None)) is not None:
-        new_node.meta['dtype'] = dtype
+    new_node.meta["submodule"] = submodule
+    if (dtype := nodes[-1].meta.get("dtype", None)) is not None:
+        new_node.meta["dtype"] = dtype
     return new_node
 
 
@@ -232,9 +252,8 @@ def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]) -> bool:
         if prev_node is not None and n not in prev_node.users:
             return False
         # We only handle dequantize after GEMM here
-        if (
-            n.target == torch.ops.quantized_ops.dequantize.default
-            and not is_gemm_op(n.args[0])
+        if n.target == torch.ops.quantized_ops.dequantize.default and not is_gemm_op(
+            n.args[0]
         ):
             return False
         if prev_node is not None:
@@ -258,7 +277,9 @@ def find_sequential_nodes_(
 ):
     def get_matched_nodes(matcher):
         return [
-            n for tgt in matcher.targets for n in nodes_by_source[tgt]
+            n
+            for tgt in matcher.targets
+            for n in nodes_by_source[tgt]
             if matcher.matches(n)
         ]
 
@@ -332,9 +353,7 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
 
     all_candidates = []
     for pattern in patterns:
-        candidates = find_sequential_nodes_(
-            pattern, nodes_order, nodes_by_source
-        )
+        candidates = find_sequential_nodes_(pattern, nodes_order, nodes_by_source)
         all_candidates.extend(candidates)
 
     all_candidates.sort(key=lambda group: len(group), reverse=True)
@@ -357,7 +376,7 @@ def is_tranpose(node: Node):
     if node.target == torch.ops.aten.transpose.int:
         ndim = node.args[0].value.ndim
         axes = {x if x >= 0 else x + ndim for x in node.args[1:]}
-        return (axes == {ndim - 2, ndim - 1})
+        return axes == {ndim - 2, ndim - 1}
 
     if node.target == torch.ops.aten.permute.default:
         permute_dims = node.args[1]
@@ -377,9 +396,9 @@ def is_mha_qkv_permute(node):
     """
     # Don't support head dimension not being a power of 2
     if (
-        not hasattr(node, 'shape') or
-        len(node.shape) != 4 or
-        not math.log2(node.shape[-1]).is_integer()
+        not hasattr(node, "shape")
+        or len(node.shape) != 4
+        or not math.log2(node.shape[-1]).is_integer()
     ):
         return False
 
@@ -452,13 +471,13 @@ def move_transpose_after_select(graph: torch.fx.Graph, nodes: List[Node]):
     user_node = next(iter(select_nodes[-1].users))
     ndim = transpose_node.value.ndim
     dims = [
-        (x + ndim if x < 0 else x) - len(select_nodes)
-        for x in transpose_node.args[1:]
+        (x + ndim if x < 0 else x) - len(select_nodes) for x in transpose_node.args[1:]
     ]
 
     with graph.inserting_before(user_node):
         new_node = graph.call_function(
-            torch.ops.aten.transpose.int, (select_nodes[-1], *dims),
+            torch.ops.aten.transpose.int,
+            (select_nodes[-1], *dims),
         )
 
     user_node.replace_input_with(select_nodes[-1], new_node)
@@ -479,7 +498,7 @@ def _fuse_reshape_with_input_impl(
     nodes_map: Dict[Node, Node],
     current_node: Node,
     fused_nodes: List[Node],
-    simulate: bool = False
+    simulate: bool = False,
 ) -> Union[bool, List[Node]]:
     reshape_node = fused_nodes[0]
     fused_nodes.append(current_node)
@@ -487,10 +506,16 @@ def _fuse_reshape_with_input_impl(
     # Check if fusion is valid
     if is_gemm_op(current_node) and not is_fully_connected(current_node):
         input_node = fused_nodes[-2]
+        controller_scale_permute = reshape_node.meta.get(
+            "matrix_controller_scale_permute", False
+        ) and input_node in (
+            current_node.kwargs.get("input_scale"),
+            current_node.kwargs.get("weight_scale"),
+        )
         if is_mha_qkv_permute(reshape_node):
-            can_fuse = input_node == current_node.args[0]
+            can_fuse = input_node == current_node.args[0] or controller_scale_permute
         elif is_tranpose(reshape_node):
-            can_fuse = input_node in current_node.args[:2]
+            can_fuse = input_node in current_node.args[:2] or controller_scale_permute
         else:
             can_fuse = False
     elif is_elementwise_op(current_node):
@@ -512,13 +537,10 @@ def _fuse_reshape_with_input_impl(
     else:
         logger.warning(f"Cannot fuse {reshape_node} with {current_node}")
 
-    if (
-        not is_nop(current_node)
-        and not (
-            is_tranpose(reshape_node)
-            and current_node.target == torch.ops.aten.select.int
-            and current_node.args[1] == 0
-        )
+    if not is_nop(current_node) and not (
+        is_tranpose(reshape_node)
+        and current_node.target == torch.ops.aten.select.int
+        and current_node.args[1] == 0
     ):
         logger.info(f"Cannot fuse {reshape_node} with {current_node}")
         return False if simulate else []
@@ -541,7 +563,7 @@ def fuse_reshape_with_input(
     graph: torch.fx.Graph,
     candidates: List[List[Node]],
     nodes_map: Dict[Node, Node],
-    reshape_node: Node
+    reshape_node: Node,
 ):
     # First pass: simulate fusion to ensure all users can be fused
     for user in list(reshape_node.users):
@@ -563,7 +585,7 @@ def fuse_reshape_with_output(
     graph: torch.fx.Graph,
     candidates: List[List[Node]],
     nodes_map: Dict[Node, Node],
-    reshape_node: Node
+    reshape_node: Node,
 ) -> bool:
     if not is_mha_qkv_permute(reshape_node):
         return False
@@ -608,20 +630,17 @@ def fuse_dequantize_with_gemm_or_elementwise(
     graph, candidates, nodes_map, node_to_fuse
 ):
     for user in list(node_to_fuse.users):
-        _fuse_dequantize_recursive(
-            graph, candidates, nodes_map, user, [node_to_fuse]
-        )
+        _fuse_dequantize_recursive(graph, candidates, nodes_map, user, [node_to_fuse])
 
 
-def _fuse_dequantize_recursive(
-    graph, candidates, nodes_map, current_node, fused_nodes
-):
+def _fuse_dequantize_recursive(graph, candidates, nodes_map, current_node, fused_nodes):
     fused_nodes.append(current_node)
 
     if (
         is_gemm_op(current_node)
         or is_elementwise_op(current_node)
-        or current_node.target in [
+        or current_node.target
+        in [
             torch.ops.aten.layer_norm.default,
             torch.ops.aten.rms_norm.default,
             torch.ops.aten.softmax.int,
@@ -637,10 +656,7 @@ def _fuse_dequantize_recursive(
             candidates.append(fused_nodes)
         return
 
-    if (
-        current_node.target != torch.ops.aten.select.int
-        and not is_nop(current_node)
-    ):
+    if current_node.target != torch.ops.aten.select.int and not is_nop(current_node):
         logger.info(f"Cannot fuse {fused_nodes[0]} with {current_node}")
         return
 
@@ -686,10 +702,11 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
                 continue
             with graph.inserting_before(user_node):
                 arg = graph.call_function(
-                    torch.ops.aten.select.int, (arg,) + sel_node.args[1:],
+                    torch.ops.aten.select.int,
+                    (arg,) + sel_node.args[1:],
                 )
             propagate_shape(arg)
-            arg.meta['dtype'] = arg.args[0].meta.get('dtype', None)
+            arg.meta["dtype"] = arg.args[0].meta.get("dtype", None)
         return arg
 
     with graph.inserting_before(user_node):
@@ -709,7 +726,7 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
 
     for n in select_nodes + [new_node]:
         propagate_shape(n)
-        n.meta['dtype'] = n.args[0].meta.get('dtype', None)
+        n.meta["dtype"] = n.args[0].meta.get("dtype", None)
 
     # Respect the order of nodes appearing in the graph
     nodes = [n for n in nodes if n not in select_nodes and n != node_to_move]
@@ -720,7 +737,7 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
 def fuse_operator(
     model: GraphModule,
     operations: List[List[Callable]] = None,
-    fuse_reshape: bool = True
+    fuse_reshape: bool = True,
 ):
     """
     Fuse reshape, slicing, and dequantize operations with their immediate users.
@@ -744,16 +761,12 @@ def fuse_operator(
 
     for node in list(graph.nodes):
         # Try to fuse MHA QKV permute with preceeding GEMM
-        if fuse_reshape_with_output(
-            graph, fused_nodes_list, nodes_map, node
-        ):
+        if fuse_reshape_with_output(graph, fused_nodes_list, nodes_map, node):
             continue
 
         # Attempt to fuse it with its immediate user
         if fuse_reshape and is_reshape_op(node):
-            fuse_reshape_with_input(
-                graph, fused_nodes_list, nodes_map, node
-            )
+            fuse_reshape_with_input(graph, fused_nodes_list, nodes_map, node)
 
     for node in list(graph.nodes):
         if node.target != torch.ops.quantized_ops.dequantize.default:
@@ -786,16 +799,16 @@ def fuse_operator(
                 continue
 
             fused_node = next(iter(n for n in gm.graph.nodes if n.name == name))
-            fused_node.meta['fused'] = True
+            fused_node.meta["fused"] = True
 
             if is_reshape_op(fused_node):
-                if next(iter(fused_node.users)).op == 'output':
-                    node.meta['reshape'] = fused_node
+                if next(iter(fused_node.users)).op == "output":
+                    node.meta["reshape"] = fused_node
                 else:
-                    n.meta['reshape'] = fused_node
+                    n.meta["reshape"] = fused_node
 
             if fused_node.target == torch.ops.quantized_ops.dequantize.default:
-                n.meta['dequantize'] = fused_node
+                n.meta["dequantize"] = fused_node
 
     graph.lint()
     graph.eliminate_dead_code()
@@ -804,16 +817,14 @@ def fuse_operator(
 
 
 def get_node_bytes(n: Node):
-    if (dtype := n.meta.get('dtype', None)) is None:
+    if (dtype := n.meta.get("dtype", None)) is None:
         if isinstance(n.value, (list, tuple)):
             return (dtype_byte_size(t.dtype) for t in (n.value))
         else:
             return dtype_byte_size(n.value.dtype)
 
     if isinstance(dtype, (list, tuple)):
-        dtypes = [
-            t if t is not None else v.dtype for t, v in zip(dtype, n.value)
-        ]
+        dtypes = [t if t is not None else v.dtype for t, v in zip(dtype, n.value)]
         return (dtype_byte_size(t) for t in dtypes)
 
     return dtype_byte_size(dtype if dtype is not None else n.value.dtype)
@@ -835,14 +846,12 @@ def get_tiled_tensor(arg, tiled_shapes=None):
 
 def get_node_to_key_map(node):
     args_and_kwargs = normalize_function(
-        node.target,
-        node.args,
-        node.kwargs,
-        normalize_to_only_use_kwargs=True
+        node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     )
     node_to_key = {
-        n.meta.get('source_node', n): k
-        for k, n in args_and_kwargs.kwargs.items() if isinstance(n, Node)
+        n.meta.get("source_node", n): k
+        for k, n in args_and_kwargs.kwargs.items()
+        if isinstance(n, Node)
     }
     node_to_key[node] = "output"
     return node_to_key
@@ -850,9 +859,7 @@ def get_node_to_key_map(node):
 
 def normalize_shape(node, shape):
     node_to_key = get_node_to_key_map(node)
-    shape = {
-        n: shape[k] for n, k in node_to_key.items() if k in shape
-    }
+    shape = {n: shape[k] for n, k in node_to_key.items() if k in shape}
     return shape
 
 
@@ -925,7 +932,7 @@ def run_submod_l2_tiling(
         get_valid_tiling,
         compute_tiled_shape,
         compute_output_tiled_shapes,
-        _merge_tiling
+        _merge_tiling,
     )
 
     first_node = get_reference_node(module.graph.nodes)
@@ -936,9 +943,10 @@ def run_submod_l2_tiling(
 
     # Unsupported operations for L2 tiling adjustment
     if (
-        not is_gemm_op(first_node) and
-        not is_elementwise_op(first_node) and
-        first_node.target not in [
+        not is_gemm_op(first_node)
+        and not is_elementwise_op(first_node)
+        and first_node.target
+        not in [
             torch.ops.aten.softmax.int,
             torch.ops.aten.layer_norm.default,
             torch.ops.aten.rms_norm.default,
@@ -970,7 +978,7 @@ def run_submod_l2_tiling(
         # We are not doing tiling on Y, X and C dimensions for conv layers here
         if is_conv2d(first_node):
             dim = 3 if transposed else 1
-            min_sizes = output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1:]
+            min_sizes = output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1 :]
         else:
             min_x_size = min(sum(unroll_dims), math.prod(output_shape[:-1]))
             min_sizes = (min_x_size, unroll_dims[0])
@@ -988,9 +996,7 @@ def run_submod_l2_tiling(
             if n not in new_shapes and require_allocation(n):
                 new_shapes[n] = compute_tiled_shape(tiled_shapes[n], tiling)
 
-        new_shapes[node] = compute_output_tiled_shapes(
-            node, tiling, tiled_shapes[node]
-        )
+        new_shapes[node] = compute_output_tiled_shapes(node, tiling, tiled_shapes[node])
 
         logger.debug("Proposed new shapes:")
         for n, s in new_shapes.items():
@@ -1043,9 +1049,9 @@ def propagate_tiled_shapes_upstream(start_node, tiled_shapes):
 
         orig_shape = node.shape
 
-        assert len(tiled_shape) == len(orig_shape), (
-            f"Rank mismatch: {len(tiled_shape)} vs {len(orig_shape)}"
-        )
+        assert len(tiled_shape) == len(
+            orig_shape
+        ), f"Rank mismatch: {len(tiled_shape)} vs {len(orig_shape)}"
         factors = tuple(o // s for o, s in zip(orig_shape, tiled_shape))
 
         for n in node.all_input_nodes:
@@ -1066,7 +1072,7 @@ def run_memory_mapping(
     cache_size: int = None,
     num_banks: int = None,
     bank_width: int = None,
-    unroll_dims=None
+    unroll_dims=None,
 ):
     graph = model.graph
     named_modules = dict(model.named_modules(remove_duplicate=False))
@@ -1090,7 +1096,7 @@ def run_memory_mapping(
     allocator.snapshot()
 
     def is_impure_node(n):
-        return n.op in ['placeholder', 'output']
+        return n.op in ["placeholder", "output"]
 
     model.graph.eliminate_dead_code(is_impure_node=is_impure_node)
 
@@ -1098,8 +1104,8 @@ def run_memory_mapping(
     # of a given node. This represents the *last* use of the node in the
     # execution order of the program, which we will use to free unused
     # values
-    node_to_last_use : Dict[Node, Node] = {}
-    user_to_last_uses : Dict[Node, List[Node]] = {}
+    node_to_last_use: Dict[Node, Node] = {}
+    user_to_last_uses: Dict[Node, List[Node]] = {}
 
     def register_last_uses(n: Node, user: Node):
         if n not in node_to_last_use and n.op != "get_attr":
@@ -1107,9 +1113,9 @@ def run_memory_mapping(
             user_to_last_uses.setdefault(user, []).append(n)
 
             if (
-                is_nop(n) or
-                is_indexing_or_concatenation_op(n) or
-                n.target == operator.getitem
+                is_nop(n)
+                or is_indexing_or_concatenation_op(n)
+                or n.target == operator.getitem
             ):
                 for arg in n.all_input_nodes:
                     register_last_uses(arg, user)
@@ -1170,7 +1176,8 @@ def run_memory_mapping(
             tiled_shapes[node] = compute_output_tiled_shapes(node, l2_tiling)
 
         tiled_shapes = {
-            n: s for n, s in tiled_shapes.items()
+            n: s
+            for n, s in tiled_shapes.items()
             if n in node.all_input_nodes and require_allocation(n) or n is node
         }
 
@@ -1202,7 +1209,7 @@ def run_memory_mapping(
                     tiled_shapes,
                     bank_width,
                     bank_size,
-                    unroll_dims[1]
+                    unroll_dims[1],
                 )
                 new_shapes = tiled_shapes if l2_tiling else None
 
@@ -1245,10 +1252,9 @@ def run_memory_mapping(
 
     def create_copy_node(node: Node, user: Node):
         from .passes.tiling import run_vector_op_node_l2_tiling
+
         with graph.inserting_before(user):
-            copy_node = graph.call_function(
-                torch.ops.aten.add.Scalar, (node, 0)
-            )
+            copy_node = graph.call_function(torch.ops.aten.add.Scalar, (node, 0))
         user.replace_input_with(node, copy_node)
         propagate_shape(copy_node, model)
         register_last_uses(copy_node, user)
@@ -1256,7 +1262,7 @@ def run_memory_mapping(
             run_vector_op_node_l2_tiling(
                 copy_node, unroll_dims[1], cache_size, num_banks
             )
-        copy_node.meta['dtype'] = node.meta.get('dtype', None)
+        copy_node.meta["dtype"] = node.meta.get("dtype", None)
         return copy_node
 
     def allocate_for_stack_op(node: Node):
@@ -1288,9 +1294,7 @@ def run_memory_mapping(
             index = stack_node.args[0].index(nodes[-2])
             start_offset = memory.start + sum(tensor_sizes[:index])
             size = tensor_sizes[index]
-            segment = Segment(
-                start_offset, start_offset + size, allocator.memory_space
-            )
+            segment = Segment(start_offset, start_offset + size, allocator.memory_space)
 
             # If the input node is already allocated and node is a NOP, we need
             # to copy the input node over to the new location
@@ -1318,9 +1322,7 @@ def run_memory_mapping(
             for n in nodes[:-1]:
                 n.meta["memory"] = segment
                 allocate_scratchpad(n)
-        elif node.target in [
-            torch.ops.aten.stack.default, torch.ops.aten.cat.default
-        ]:
+        elif node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
             node.meta["memory"] = allocator.allocate_memory(node)
 
         return node.meta.get("memory")
@@ -1336,16 +1338,18 @@ def run_memory_mapping(
 
         # Propagate memory metadata for nop nodes
         if is_nop(node):
-            assert "memory" in node.args[0].meta, (
-                f"Node {node} does not have memory metadata, "
-            )
+            assert (
+                "memory" in node.args[0].meta
+            ), f"Node {node} does not have memory metadata, "
             node.meta["memory"] = copy.deepcopy(node.args[0].meta["memory"])
             skip_allocation = True
 
         if node.target == operator.getitem:
             input_node = node.args[0]
             output_sizes = input_node.meta["output_sizes"]
-            start_offset = input_node.meta["memory"].start + sum(output_sizes[:node.args[1]])
+            start_offset = input_node.meta["memory"].start + sum(
+                output_sizes[: node.args[1]]
+            )
             size = output_sizes[node.args[1]]
             node.meta["memory"] = Segment(
                 start_offset, start_offset + size, allocator.memory_space
@@ -1355,9 +1359,8 @@ def run_memory_mapping(
         # We do not allocate new memory for select operations. Instead, calculate
         # the memory offset from the select index
         # TODO: Fuse select operation with its user if possible. Do not handle it here
-        if (
-            node.target == torch.ops.aten.select.int and
-            all(d == 1 for d in node.args[0].value.shape[:node.args[1]])
+        if node.target == torch.ops.aten.select.int and all(
+            d == 1 for d in node.args[0].value.shape[: node.args[1]]
         ):
             size = node.value.numel() * get_node_bytes(node)
             start_offset = node.args[0].meta["memory"].start + node.args[2] * size
@@ -1373,7 +1376,9 @@ def run_memory_mapping(
                 continue
 
             if node.meta.get("memory") is None:
-                logger.warning(f"WARNING: stack node {node} does not have memory allocated")
+                logger.warning(
+                    f"WARNING: stack node {node} does not have memory allocated"
+                )
 
         allocate_for_stack_op(node)
 
@@ -1409,24 +1414,24 @@ def gen_code(model, args, output_dir=None):
 
         op = Operation()
 
-        if node.op == 'placeholder':
+        if node.op == "placeholder":
             tensor = Tensor()
             set_tensor_field(tensor, node, output_dir)
             model_params.inputs.append(tensor)
             continue
-        elif node.op == 'get_attr':
+        elif node.op == "get_attr":
             tensor = Tensor()
             set_tensor_field(tensor, node, output_dir)
             if "memory" in node.meta:
                 model_params.parameters.append(tensor)
             continue
-        elif node.op == 'call_function':
+        elif node.op == "call_function":
             op.op.CopyFrom(map_node(node))
-        elif node.op == 'call_module':
+        elif node.op == "call_module":
             gm = named_modules[node.target]
             assert isinstance(gm, torch.fx.GraphModule)
 
-            if (tiled_shapes := node.meta.get('tiled_shapes')):
+            if tiled_shapes := node.meta.get("tiled_shapes"):
                 args = map_arg(node.args, lambda n: get_tiled_tensor(n, tiled_shapes))
                 ShapeProp(gm).propagate(*args)
 
@@ -1439,7 +1444,7 @@ def gen_code(model, args, output_dir=None):
 
             operators = []
             for n in gm.graph.nodes:
-                if n.op != 'call_function' or n.meta.get('fused', False) or is_nop(n):
+                if n.op != "call_function" or n.meta.get("fused", False) or is_nop(n):
                     continue
 
                 n.meta["tiled_shapes"] = tiled_shapes
@@ -1499,9 +1504,9 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
         if node.op == "call_module":
             gm = named_modules[node.target]
             if isinstance(gm, torch.fx.GraphModule):
-                body = "&#92;n".join([
-                    n.name for n in gm.graph.nodes if n.op == "call_function"
-                ])
+                body = "&#92;n".join(
+                    [n.name for n in gm.graph.nodes if n.op == "call_function"]
+                )
         label = f"{{{header}}}" if body is None else f"{{{header}|{body}}}"
         label = label.replace("<", r"\<").replace(">", r"\>")
 
@@ -1544,4 +1549,4 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
 
     g.edges(edges)
 
-    g.render(output_file, format='svg', cleanup=True)
+    g.render(output_file, format="svg", cleanup=True)

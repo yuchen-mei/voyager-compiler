@@ -8,7 +8,7 @@ from torch.fx import GraphModule, Node
 
 from .utils import get_arg_value, _pair
 from ..banking import require_allocation
-from ..mapping import duplicate_shared_nodes
+from ..mapping import duplicate_shared_nodes, is_mha_qkv_permute
 from ..mapping_utils import (
     is_conv2d,
     is_depthwise_conv,
@@ -174,8 +174,10 @@ def _get_path_to_conv2d(node: torch.fx.Node):
             return [node, user]
 
         if (
-            is_nop(user) or is_indexing_or_concatenation_op(user)
-            or user.target in [
+            is_nop(user)
+            or is_indexing_or_concatenation_op(user)
+            or user.target
+            in [
                 torch.ops.quantized_ops.quantize.default,
                 torch.ops.aten.pad.default,
             ]
@@ -186,9 +188,7 @@ def _get_path_to_conv2d(node: torch.fx.Node):
     return None
 
 
-def _process_conv2d_input_nodes(
-    node: Node, model: GraphModule, island_set: Set[Node]
-):
+def _process_conv2d_input_nodes(node: Node, model: GraphModule, island_set: Set[Node]):
     graph = model.graph
     path = _get_path_to_conv2d(node)
 
@@ -196,7 +196,8 @@ def _process_conv2d_input_nodes(
     if node.op == "get_attr" and path is not None:
         conv2d_node = path[-1]
         if is_depthwise_conv(conv2d_node) or path[-2] not in (
-            conv2d_node.args[1], conv2d_node.kwargs.get("weight_scale")
+            conv2d_node.args[1],
+            conv2d_node.kwargs.get("weight_scale"),
         ):
             return
 
@@ -208,15 +209,14 @@ def _process_conv2d_input_nodes(
 
     # Case B: Input is a node flow from outside the island
     if node.op != "get_attr" and len(node.shape) == 4:
-        is_weight_node = (
-            path is not None and id(path[-2]) == id(path[-1].args[1])
-        )
+        is_weight_node = path is not None and id(path[-2]) == id(path[-1].args[1])
         dims = WEIGHT_NCHW_TO_HWIO if is_weight_node else NCHW_TO_NHWC
 
         logger.debug(f"Insert permute after {node} with dims {dims}")
         with graph.inserting_after(node):
             permute_node = graph.call_function(
-                torch.ops.aten.permute.default, (node, dims),
+                torch.ops.aten.permute.default,
+                (node, dims),
             )
 
         permute_node.meta["dims"] = dims
@@ -307,7 +307,7 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
             if is_conv2d(node_to_treat) and tiled_shapes is not None:
                 for key, arg in [
                     ("input", node_to_treat.args[0]),
-                    ("weight", node_to_treat.args[1])
+                    ("weight", node_to_treat.args[1]),
                 ]:
                     input_dims = arg.meta["dims"]
                     tiled_shapes[key] = permute(tiled_shapes[key], input_dims)
@@ -343,9 +343,8 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
         input_node = node.all_input_nodes[0]
 
         group = []
-        while (
-            len(curr_node.users) == 1
-            and (is_reshape_op(curr_node) or is_nop(curr_node))
+        while len(curr_node.users) == 1 and (
+            is_reshape_op(curr_node) or is_nop(curr_node)
         ):
             group.append(curr_node)
             curr_node = next(iter(curr_node.users))
@@ -364,7 +363,7 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
             if torch.equal(x.reshape(-1), orig_x):
                 last_valid_idx = i
 
-        del group[last_valid_idx + 1:]
+        del group[last_valid_idx + 1 :]
 
         if len(group) <= 1:
             continue
@@ -398,12 +397,14 @@ def make_linear_wrapper(transpose=False, skip_fc=False):
     Returns a function that wraps torch.nn.functional.linear with optional
     weight transposition.
     """
+
     def wrapped_linear(input, weight, bias=None):
         is_fc = all(dim == 1 for dim in input.shape[:-1])
         do_transpose = transpose and not (skip_fc and is_fc)
         return torch.ops.aten.linear.default(
             input, weight.T if do_transpose else weight, bias
         )
+
     return wrapped_linear
 
 
@@ -412,6 +413,7 @@ def make_matmul_wrapper(transpose=False, skip_fc=False):
     Returns a function that wraps torch.matmul with optional transposition of
     the second argument.
     """
+
     def wrapped_matmul(input, other):
         input_shape = input.shape
         other_shape = other.shape
@@ -427,6 +429,7 @@ def make_matmul_wrapper(transpose=False, skip_fc=False):
         return torch.ops.aten.matmul.default(
             input, other if do_transpose else other.transpose(-2, -1)
         )
+
     return wrapped_matmul
 
 
@@ -522,7 +525,7 @@ def _fix_axes_after_transpose(node: Node) -> List[int]:
 
     # Apply inverse permutation
     new_axes = tuple(inv_perm[a] for a in norm_axes)
-    node.args = node.args[:index] + (new_axes,) + node.args[index + 1:]
+    node.args = node.args[:index] + (new_axes,) + node.args[index + 1 :]
 
 
 def _fuse_quantize_mx_last_axis(model: GraphModule):
@@ -542,10 +545,13 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
 
         args = node.args[1:] + (None,) * (5 - len(node.args[1:]))
 
-        quantize_node = next(iter(
-            n for n in node.users
-            if n.target == torch.ops.quantized_ops.quantize.default
-        ))
+        quantize_node = next(
+            iter(
+                n
+                for n in node.users
+                if n.target == torch.ops.quantized_ops.quantize.default
+            )
+        )
 
         assert quantize_node.args[0] == node.args[0], "Unexpected quantize input"
 
@@ -559,14 +565,10 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
                 new_code = graph.node_copy(output_code)
             quantize_mx_node = graph.call_function(
                 torch.ops.quantized_ops.quantize_mx.default,
-                (node.args[0], new_qmap) + args + (new_code,)
+                (node.args[0], new_qmap) + args + (new_code,),
             )
-            scale_node = graph.call_function(
-                operator.getitem, (quantize_mx_node, 0)
-            )
-            output_node = graph.call_function(
-                operator.getitem, (quantize_mx_node, 1)
-            )
+            scale_node = graph.call_function(operator.getitem, (quantize_mx_node, 0))
+            output_node = graph.call_function(operator.getitem, (quantize_mx_node, 1))
 
         propagate_shape(new_qmap, model)
         if new_code is not None:
@@ -578,7 +580,8 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
         scale_node.meta["dtype"] = node.meta.get("dtype")
         output_node.meta["dtype"] = quantize_node.meta.get("dtype")
         quantize_mx_node.meta["dtype"] = (
-            scale_node.meta.get("dtype"), output_node.meta.get("dtype")
+            scale_node.meta.get("dtype"),
+            output_node.meta.get("dtype"),
         )
 
         node.replace_all_uses_with(scale_node)
@@ -587,6 +590,364 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
         logger.info(f"Replaced {node} and {quantize_node} with {quantize_mx_node}")
 
     graph.lint()
+    model.recompile()
+    return model
+
+
+def _move_attention_weight_transpose_after_mx_quantization(
+    model: GraphModule,
+) -> GraphModule:
+    """Move an attention-key transpose from BF16 into MatrixUnit input metadata.
+
+    ``transpose_linear_weights`` calls this before its normal per-GEMM layout
+    handling when hardware weight-layout transformation is enabled. Attention
+    score matmuls arrive after BMM decomposition, so one shared BF16 key tensor
+    feeds many per-head MatrixUnit ops through ``select`` chains. The input is
+    currently transposed before ``calculate_mx_qparam``/``quantize``; that
+    materializes a standalone CGRA transpose and prevents Voyager's existing
+    WeightController transpose path from seeing the layout operation.
+
+    This pass moves the shared last-two-axis transpose after both MX data and
+    scale quantization. It changes the quantization axis to preserve the same
+    reduction-dimension blocks, updates every intervening select value, and
+    inserts a logical transpose immediately on each MatrixUnit data and scale
+    operand. Final reshape fusion consumes those logical transposes, serializes
+    them on the protobuf tensor operands, and lets ``MatrixOps`` assert
+    ``weight_transpose`` for both WeightController and WeightScaleController.
+
+    Args:
+        model: Quantized FX graph after BMM decomposition and before operator
+            fusion.
+
+    Returns:
+        The same graph module, mutated in place. Unsupported or partially
+        shared transpose patterns are left unchanged.
+    """
+    graph = model.graph
+    node_order = {node: idx for idx, node in enumerate(graph.nodes)}
+
+    for transpose_node in list(graph.nodes):
+        if not is_transpose_2d(transpose_node):
+            continue
+
+        qparam_nodes = [
+            user
+            for user in transpose_node.users
+            if user.target == torch.ops.quantized_ops.calculate_mx_qparam.default
+            and user.args[0] == transpose_node
+        ]
+        quantize_nodes = [
+            user
+            for user in transpose_node.users
+            if user.target == torch.ops.quantized_ops.quantize.default
+            and user.args[0] == transpose_node
+        ]
+        handled_transpose_users = set(qparam_nodes + quantize_nodes)
+        if (
+            len(qparam_nodes) != 1
+            or len(quantize_nodes) != 1
+            or set(transpose_node.users) != handled_transpose_users
+        ):
+            continue
+
+        qparam_node = qparam_nodes[0]
+        quantize_node = quantize_nodes[0]
+        if quantize_node.args[1] != qparam_node:
+            continue
+
+        data_frontier = [quantize_node]
+        data_path_nodes = set()
+        data_consumers = []
+        data_pattern_supported = True
+        while data_frontier:
+            current = data_frontier.pop()
+            for user in current.users:
+                if is_matmul(user) and len(user.args) > 1 and user.args[1] == current:
+                    data_consumers.append((user, current))
+                elif user.target == torch.ops.aten.select.int or is_nop(user):
+                    if user not in data_path_nodes:
+                        data_path_nodes.add(user)
+                        data_frontier.append(user)
+                else:
+                    data_pattern_supported = False
+
+        scale_frontier = [qparam_node]
+        scale_path_nodes = set()
+        scale_consumers = []
+        scale_pattern_supported = True
+        while scale_frontier:
+            current = scale_frontier.pop()
+            for user in current.users:
+                if user == quantize_node:
+                    continue
+                if is_matmul(user) and user.kwargs.get("weight_scale") == current:
+                    scale_consumers.append((user, current))
+                elif user.target == torch.ops.aten.select.int or is_nop(user):
+                    if user not in scale_path_nodes:
+                        scale_path_nodes.add(user)
+                        scale_frontier.append(user)
+                else:
+                    scale_pattern_supported = False
+
+        data_matmuls = {consumer for consumer, _ in data_consumers}
+        scale_matmuls = {consumer for consumer, _ in scale_consumers}
+        if (
+            not data_pattern_supported
+            or not scale_pattern_supported
+            or not data_matmuls
+            or data_matmuls != scale_matmuls
+        ):
+            continue
+
+        raw_key = transpose_node.args[0]
+        qparam_node.replace_input_with(transpose_node, raw_key)
+        quantize_node.replace_input_with(transpose_node, raw_key)
+        _fix_axes_after_transpose(qparam_node)
+        _fix_axes_after_transpose(quantize_node)
+        propagate_shape(qparam_node, model)
+        propagate_shape(quantize_node, model)
+
+        for path_node in sorted(
+            data_path_nodes | scale_path_nodes, key=lambda node: node_order[node]
+        ):
+            propagate_shape(path_node, model)
+            path_node.meta["dtype"] = path_node.args[0].meta.get("dtype")
+
+        for matrix_node, data_node in data_consumers:
+            with graph.inserting_before(matrix_node):
+                data_transpose = graph.call_function(
+                    torch.ops.aten.transpose.int, (data_node, -2, -1)
+                )
+            data_transpose.meta["dtype"] = data_node.meta.get("dtype")
+            matrix_node.replace_input_with(data_node, data_transpose)
+            propagate_shape(data_transpose, model)
+
+        for matrix_node, scale_node in scale_consumers:
+            with graph.inserting_before(matrix_node):
+                scale_transpose = graph.call_function(
+                    torch.ops.aten.transpose.int, (scale_node, -2, -1)
+                )
+            scale_transpose.meta["dtype"] = scale_node.meta.get("dtype")
+            scale_transpose.meta["matrix_controller_scale_permute"] = True
+            matrix_node.replace_input_with(scale_node, scale_transpose)
+            propagate_shape(scale_transpose, model)
+
+        for matrix_node in data_matmuls:
+            matrix_node.meta["transposed"] = True
+            matrix_node.kwargs = {
+                **matrix_node.kwargs,
+                "weight_transposed": True,
+            }
+            _update_tiled_shapes(matrix_node)
+
+        if not transpose_node.users:
+            graph.erase_node(transpose_node)
+        logger.info(
+            "Moved attention-key transpose through MX quantization into %d "
+            "MatrixUnit controller input(s)",
+            len(data_matmuls),
+        )
+
+    graph.lint()
+    model.recompile()
+    return model
+
+
+def _move_mha_merge_after_mx_quantization(model: GraphModule) -> GraphModule:
+    """Move an MHA head/sequence permutation onto quantized MU input operands.
+
+    ``transpose_linear_weights`` calls this after last-axis MX quantization has
+    been canonicalized. A decomposed attention value matmul produces a shared
+    ``[B, H, S, D]`` BF16 stack which is normally permuted and flattened to
+    ``[B, S, H*D]`` before MX quantization. Materializing that permutation as a
+    standalone kernel is unnecessary because MatrixUnit's InputController and
+    InputScaleController already implement the corresponding ``merge_heads``
+    address mapping.
+
+    For each supported ``transpose -> contiguous/view/reshape -> quantize_mx``
+    chain, this pass quantizes the original head-major tensor and clones the
+    semantic permutation after both tuple outputs. The data and E8M0 scale
+    clones keep FX/gold execution unchanged; later reshape fusion records the
+    data clone on the MatrixUnit input tensor and the marked scale clone on its
+    ``input_scale`` tensor. No standalone transpose remains in the emitted
+    operation list.
+
+    Args:
+        model: Quantized FX graph before final operator fusion.
+
+    Returns:
+        The same graph module, mutated in place. Chains with sharing or an
+        unsupported consumer are conservatively preserved.
+    """
+    graph = model.graph
+
+    for transpose_node in list(graph.nodes):
+        if transpose_node.target == torch.ops.aten.transpose.int:
+            logger.debug(
+                "Inspecting transpose %s for MHA merge-heads movement: "
+                "shape=%s, dims=%s, users=%s",
+                transpose_node.name,
+                getattr(transpose_node, "shape", None),
+                transpose_node.args[1:],
+                [user.name for user in transpose_node.users],
+            )
+        if not is_mha_qkv_permute(transpose_node):
+            continue
+
+        chain = [transpose_node]
+        current = transpose_node
+        while len(current.users) == 1:
+            user = next(iter(current.users))
+            if user.target == torch.ops.quantized_ops.quantize_mx.default:
+                quantize_node = user
+                break
+            if not is_nop(user) and user.target not in (
+                torch.ops.aten.reshape.default,
+                torch.ops.aten.view.default,
+            ):
+                quantize_node = None
+                break
+            chain.append(user)
+            current = user
+        else:
+            quantize_node = None
+
+        if quantize_node is None or quantize_node.args[0] != chain[-1]:
+            continue
+        if not any(
+            node.target in (torch.ops.aten.reshape.default, torch.ops.aten.view.default)
+            and len(node.shape) < len(transpose_node.shape)
+            for node in chain[1:]
+        ):
+            continue
+
+        output_getitems = [
+            user
+            for user in quantize_node.users
+            if user.target == operator.getitem and user.args[0] == quantize_node
+        ]
+        if {int(node.args[1]) for node in output_getitems} != {0, 1} or len(
+            output_getitems
+        ) != 2:
+            continue
+
+        quantize_node.replace_input_with(chain[-1], transpose_node.args[0])
+        propagate_shape(quantize_node, model)
+
+        for getitem_node in sorted(output_getitems, key=lambda node: int(node.args[1])):
+            propagate_shape(getitem_node, model)
+            if (dtypes := quantize_node.meta.get("dtype")) is not None:
+                getitem_node.meta["dtype"] = dtypes[int(getitem_node.args[1])]
+
+            getitem_users = list(getitem_node.users)
+            slice_users = [
+                user
+                for user in getitem_users
+                if user.target == torch.ops.aten.slice.Tensor
+            ]
+            raw_head_width = int(getitem_node.shape[-1])
+            flattened_width = int(getitem_node.shape[1]) * raw_head_width
+            can_move_slices = bool(slice_users) and len(slice_users) == len(
+                getitem_users
+            )
+            if can_move_slices:
+                for slice_node in slice_users:
+                    slice_dim = int(get_arg_value(slice_node, 1, "dim", 0))
+                    if slice_dim < 0:
+                        slice_dim += len(chain[-1].shape)
+                    slice_start = get_arg_value(slice_node, 2, "start", None)
+                    slice_end = get_arg_value(slice_node, 3, "end", None)
+                    slice_step = int(get_arg_value(slice_node, 4, "step", 1))
+                    slice_start = 0 if slice_start is None else int(slice_start)
+                    slice_end = (
+                        flattened_width
+                        if slice_end is None or int(slice_end) >= flattened_width
+                        else int(slice_end)
+                    )
+                    if (
+                        slice_dim != len(chain[-1].shape) - 1
+                        or slice_step != 1
+                        or slice_start % raw_head_width != 0
+                        or slice_end % raw_head_width != 0
+                    ):
+                        can_move_slices = False
+                        break
+
+            logger.debug(
+                "MHA merge output %s: users=%s, raw_head_width=%d, "
+                "flattened_width=%d, move_slices=%s",
+                getitem_node.name,
+                [
+                    (user.name, str(user.target), tuple(user.args[1:]))
+                    for user in getitem_users
+                ],
+                raw_head_width,
+                flattened_width,
+                can_move_slices,
+            )
+
+            layout_sources = []
+            if can_move_slices:
+                for slice_node in slice_users:
+                    slice_start = get_arg_value(slice_node, 2, "start", None)
+                    slice_end = get_arg_value(slice_node, 3, "end", None)
+                    slice_start = 0 if slice_start is None else int(slice_start)
+                    slice_end = (
+                        flattened_width
+                        if slice_end is None or int(slice_end) >= flattened_width
+                        else int(slice_end)
+                    )
+                    with graph.inserting_before(slice_node):
+                        raw_slice = graph.call_function(
+                            torch.ops.aten.slice.Tensor,
+                            (
+                                getitem_node,
+                                1,
+                                slice_start // raw_head_width,
+                                slice_end // raw_head_width,
+                                1,
+                            ),
+                        )
+                    raw_slice.meta["dtype"] = getitem_node.meta.get("dtype")
+                    propagate_shape(raw_slice, model)
+                    layout_sources.append((raw_slice, slice_node))
+            else:
+                layout_sources.append((getitem_node, None))
+
+            for layout_source, replaced_slice in layout_sources:
+                value_remap = {chain[0].args[0]: layout_source}
+                cloned_chain = []
+                insert_after = layout_source
+                for original_node in chain:
+                    with graph.inserting_after(insert_after):
+                        cloned_node = graph.node_copy(
+                            original_node, lambda node: value_remap.get(node, node)
+                        )
+                    value_remap[original_node] = cloned_node
+                    cloned_node.meta["dtype"] = getitem_node.meta.get("dtype")
+                    propagate_shape(cloned_node, model)
+                    cloned_chain.append(cloned_node)
+                    insert_after = cloned_node
+
+                final_reshape = cloned_chain[-1]
+                if replaced_slice is None:
+                    for user in list(getitem_node.users):
+                        if user != cloned_chain[0]:
+                            user.replace_input_with(getitem_node, final_reshape)
+                else:
+                    replaced_slice.replace_all_uses_with(final_reshape)
+                    graph.erase_node(replaced_slice)
+                if int(getitem_node.args[1]) == 0:
+                    cloned_chain[0].meta["matrix_controller_scale_permute"] = True
+
+        logger.info(
+            "Moved MHA merge-heads permutation through %s into MatrixUnit "
+            "data/scale controller operands",
+            quantize_node.name,
+        )
+
+    graph.lint()
+    graph.eliminate_dead_code()
     model.recompile()
     return model
 
@@ -692,16 +1053,14 @@ def move_transpose_before_dq(
 
     # Insert transpose after dequantize input
     dq_input = dequantize_node.args[0]
-    up_t = next((
-        n for n in dq_input.users if n.target == torch.ops.aten.transpose.int
-    ), None)
+    up_t = next(
+        (n for n in dq_input.users if n.target == torch.ops.aten.transpose.int), None
+    )
     if up_t is not None and up_t.meta.get("dtype") == dq_input.meta.get("dtype"):
         dequantize_node.replace_input_with(dq_input, up_t)
     else:
         with graph.inserting_after(dq_input):
-            up_t = graph.call_function(
-                torch.ops.aten.transpose.int, (dq_input, -2, -1)
-            )
+            up_t = graph.call_function(torch.ops.aten.transpose.int, (dq_input, -2, -1))
         up_t.meta["dtype"] = dq_input.meta.get("dtype")
         dequantize_node.replace_input_with(dq_input, up_t)
         propagate_shape(up_t)
@@ -778,10 +1137,7 @@ def _update_tiled_shapes(node: Node) -> None:
 
 
 def _insert_transpose_op(
-    model: GraphModule,
-    node: Node,
-    user: Node,
-    transposed_nodes: dict
+    model: GraphModule, node: Node, user: Node, transposed_nodes: dict
 ) -> Optional[List[Node]]:
     """Inserts a transpose operation before the user node."""
     with model.graph.inserting_before(user):
@@ -800,17 +1156,12 @@ def _insert_transpose_op(
     node_order = {n: i for i, n in enumerate(model.graph.nodes)}
     sorted_path = sorted(path, key=lambda n: node_order[n])
 
-    success = eliminate_canceling_transposes(
-        model, sorted_path, transposed_nodes
-    )
+    success = eliminate_canceling_transposes(model, sorted_path, transposed_nodes)
     return None if success else sorted_path
 
 
 def _process_linear_node(
-    model: GraphModule,
-    node: Node,
-    transpose_weight: bool,
-    skip_fc: bool
+    model: GraphModule, node: Node, transpose_weight: bool, skip_fc: bool
 ) -> None:
     """Handles weight mutation for Linear nodes."""
     is_fc = is_fully_connected(node)
@@ -847,7 +1198,7 @@ def _process_matmul_node(
     node: Node,
     transpose_weight: bool,
     transpose_fc: bool,
-    transposed_nodes: dict
+    transposed_nodes: dict,
 ) -> None:
     """Handles graph transformation for MatMul nodes."""
     is_fc = is_fully_connected(node)
@@ -887,6 +1238,9 @@ def transpose_linear_weights(
 
     transposed_nodes = {}
 
+    if transpose_weight:
+        _move_attention_weight_transpose_after_mx_quantization(model)
+
     for node in list(model.graph.nodes):
         if is_linear(node):
             _process_linear_node(model, node, transpose_weight, skip_fc)
@@ -897,6 +1251,7 @@ def transpose_linear_weights(
 
     deduplicate_nodes(model)
     _fuse_quantize_mx_last_axis(model)
+    _move_mha_merge_after_mx_quantization(model)
 
     model.graph.lint()
     model.recompile()
