@@ -29,6 +29,7 @@ from voyager_compiler import (
     extract_input_preprocessor,
     fuse,
     get_default_quantizer,
+    microscaling,
     prepare_pt2e,
     print_node_scope_tabular,
     sink_obs_or_fq,
@@ -37,7 +38,7 @@ from voyager_compiler import (
 )
 from voyager_compiler.codegen import (
     inline_autocast_modules,
-    replace_rmsnorm_with_layer_norm,
+    replace_rmsnorm_with_rms_norm,
     remove_softmax_dtype_cast,
 )
 from voyager_compiler.codegen.mapping_utils import is_fully_connected
@@ -176,8 +177,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--context_length",
         type=int,
-        default=512,
-        help="Context length for the LLM decoding."
+        default=None,
+        help="LLM context length (default: 1024 for Nemotron VL, 512 otherwise)."
     )
     parser.add_argument(
         "--compile_single_layer",
@@ -271,6 +272,8 @@ if __name__ == "__main__":
     )
     add_qspec_args(parser)
     args = parser.parse_args()
+    if args.context_length is None:
+        args.context_length = 1024 if args.model == "nemotron_vl_prefill" else 512
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -392,112 +395,186 @@ if __name__ == "__main__":
         if args.evaluate:
             bert.evaluate_gm(gm, preprocessed_dataset)
 
-    elif args.model == "llm_prefill" or args.model == "llm_decode":
-        from transformers import AutoModelForCausalLM
-
-        if args.model_name_or_path is None:
-            args.model_name_or_path = "meta-llama/Llama-3.1-8B"
-
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
-            attn_implementation=args.attn_implementation,
-        )
-
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-
-        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
-
-        input_ids = encodings.input_ids[:,:args.context_length]
-
-        past_key_values = None
-
-        if args.model == "llm_decode":
-            past_key_values = StaticCache(
-                config=model.config,
-                max_batch_size=1,
-                max_cache_len=input_ids.shape[1] + 128,
-                dtype=model.dtype
+    elif args.model in ("llm_prefill", "llm_decode", "nemotron_vl_prefill"):
+        if args.model == "nemotron_vl_prefill":
+            # This optional model adapter belongs to AHA; add the AHA checkout
+            # root to PYTHONPATH when selecting it from this standalone script.
+            from strait.proto_frontend.utils.models.nemotron_vl import (
+                NEMOTRON_VL_MODEL_ID,
+                NemotronVLEmbeddingPrefill,
+                export_nemotron_vl,
+                load_nemotron_vl_text,
+                lower_nemotron_to_bf16,
             )
 
-            with torch.no_grad():
-                outputs = model(input_ids, past_key_values=past_key_values, use_cache=True)
-
-            input_ids = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-            past_key_values = outputs.past_key_values
-
-        inputs_embeds = model.model.embed_tokens(input_ids)
-
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        )
-
-        position_ids = cache_position.unsqueeze(0)
-
-        causal_mask = TorchExportableModuleWithStaticCache._prepare_4d_causal_attention_mask_with_cache_position(
-            None,
-            sequence_length=inputs_embeds.shape[1],
-            target_length=args.context_length + 128,
-            dtype=inputs_embeds.dtype,
-            device=inputs_embeds.device,
-            cache_position=cache_position,
-            batch_size=inputs_embeds.shape[0],
-        )
-
-        if args.model == "llm_prefill":
-            causal_mask = causal_mask[:, :, :, : args.context_length]
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids)
-
-        example_args = (inputs_embeds, causal_mask, position_embeddings, cache_position)
-        example_kwargs = {}
-
-        class LlamaWrapper(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = model.model
-                self.lm_head = model.lm_head
-
-                self.static_cache = past_key_values
-
-                if self.static_cache is not None:
-                    for i in range(len(self.static_cache.layers)):
-                        self.register_buffer(f"key_cache_{i}", self.static_cache.layers[i].keys, persistent=False)
-                        self.register_buffer(f"value_cache_{i}", self.static_cache.layers[i].values, persistent=False)
-
-            def forward(
-                self,
-                hidden_states,
-                attention_mask,
-                position_embeddings,
-                cache_position=None,
-            ):
-                for decoder_layer in self.model.layers:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=attention_mask,
-                        position_embeddings=position_embeddings,
-                        past_key_values=self.static_cache,
-                        cache_position=cache_position,
+            nemotron_qspecs = [
+                QuantizationSpec.from_str(spec) if spec is not None else None
+                for spec in (args.activation, args.weight)
+            ]
+            nemotron_mxint8 = any(
+                spec is not None
+                and spec.dtype == "int8"
+                and spec.qscheme == microscaling
+                for spec in nemotron_qspecs
+            )
+            if nemotron_mxint8:
+                if (
+                    args.enable_mixed_precision
+                    or args.residual is not None
+                    or args.output_activation not in (None, "bfloat16")
+                ):
+                    parser.error(
+                        "[ERROR] Nemotron MXINT8 keeps non-GEMM operations in BF16; "
+                        "--enable_mixed_precision, --residual, and non-BF16 "
+                        "--output_activation conflict with that profile."
                     )
-                    hidden_states = layer_outputs[0]
+                if args.bias not in (None, "bfloat16"):
+                    parser.error("[ERROR] Nemotron MXINT8 requires BF16 bias.")
+                args.bias = "bfloat16"
+            if args.attn_implementation != "eager":
+                parser.error("[ERROR] Nemotron VL prefill supports only eager attention.")
+            if args.quantize_attention_mask:
+                parser.error(
+                    "[ERROR] Nemotron VL creates its causal mask inside the graph; "
+                    "--quantize_attention_mask requires an external mask input."
+                )
+            if args.model_name_or_path is None:
+                args.model_name_or_path = NEMOTRON_VL_MODEL_ID
+            model, tokenizer = load_nemotron_vl_text(
+                args.model_name_or_path,
+                torch_dtype=(
+                    torch.bfloat16 if args.bf16 or nemotron_mxint8 else torch.float16
+                ),
+            )
+            if args.compile_single_layer:
+                # This is a debug graph of the first hybrid block, preserving the
+                # final norm and vocabulary projection used by full prefill.
+                model.backbone.layers = model.backbone.layers[:1]
+            test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+            input_ids = encodings.input_ids[:, :args.context_length]
+            inputs_embeds = model.backbone.embeddings(input_ids)
+            example_args = (inputs_embeds,)
+            example_kwargs = {}
+            gm = export_nemotron_vl(
+                NemotronVLEmbeddingPrefill(model), example_args, example_kwargs
+            )
+            remove_softmax_dtype_cast(gm)
+            # Match only ordinary block/final norms. Mamba's grouped, gated norm
+            # has a different graph and must retain its grouping and gate.
+            replace_rmsnorm_with_rms_norm(
+                gm, model.backbone.layers[0].norm, example_args
+            )
+            if nemotron_mxint8:
+                # Explicitly lower the public-model FP32 islands for this
+                # deployment profile before the shared quantization pipeline.
+                gm = lower_nemotron_to_bf16(gm, example_args, example_kwargs)
+        else:
+            from transformers import AutoModelForCausalLM
 
-                    if args.compile_single_layer:
-                        break
+            if args.model_name_or_path is None:
+                args.model_name_or_path = "meta-llama/Llama-3.1-8B"
 
-                logits = self.lm_head(hidden_states)
-                return logits
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name_or_path,
+                torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
+                attn_implementation=args.attn_implementation,
+            )
 
-        gm = export_model(LlamaWrapper(), example_args, example_kwargs)
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-        remove_softmax_dtype_cast(gm)
+            test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
 
-        hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
-        example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
-        replace_rmsnorm_with_layer_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
+            input_ids = encodings.input_ids[:,:args.context_length]
+
+            past_key_values = None
+
+            if args.model == "llm_decode":
+                past_key_values = StaticCache(
+                    config=model.config,
+                    max_batch_size=1,
+                    max_cache_len=input_ids.shape[1] + 128,
+                    dtype=model.dtype
+                )
+
+                with torch.no_grad():
+                    outputs = model(input_ids, past_key_values=past_key_values, use_cache=True)
+
+                input_ids = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+                past_key_values = outputs.past_key_values
+
+            inputs_embeds = model.model.embed_tokens(input_ids)
+
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+            position_ids = cache_position.unsqueeze(0)
+
+            causal_mask = TorchExportableModuleWithStaticCache._prepare_4d_causal_attention_mask_with_cache_position(
+                None,
+                sequence_length=inputs_embeds.shape[1],
+                target_length=args.context_length + 128,
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                cache_position=cache_position,
+                batch_size=inputs_embeds.shape[0],
+            )
+
+            if args.model == "llm_prefill":
+                causal_mask = causal_mask[:, :, :, : args.context_length]
+
+            # create position embeddings to be shared across the decoder layers
+            position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids)
+
+            example_args = (inputs_embeds, causal_mask, position_embeddings, cache_position)
+            example_kwargs = {}
+
+            class LlamaWrapper(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.model = model.model
+                    self.lm_head = model.lm_head
+
+                    self.static_cache = past_key_values
+
+                    if self.static_cache is not None:
+                        for i in range(len(self.static_cache.layers)):
+                            self.register_buffer(f"key_cache_{i}", self.static_cache.layers[i].keys, persistent=False)
+                            self.register_buffer(f"value_cache_{i}", self.static_cache.layers[i].values, persistent=False)
+
+                def forward(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    position_embeddings,
+                    cache_position=None,
+                ):
+                    for decoder_layer in self.model.layers:
+                        layer_outputs = decoder_layer(
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            position_embeddings=position_embeddings,
+                            past_key_values=self.static_cache,
+                            cache_position=cache_position,
+                        )
+                        hidden_states = layer_outputs[0]
+
+                        if args.compile_single_layer:
+                            break
+
+                    logits = self.lm_head(hidden_states)
+                    return logits
+
+            gm = export_model(LlamaWrapper(), example_args, example_kwargs)
+
+            remove_softmax_dtype_cast(gm)
+
+            hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
+            example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
+            replace_rmsnorm_with_rms_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
 
         if args.enable_mixed_precision:
             qconfig = get_llama_qconfig(args.hardware_unrolling[0], args.outlier_pct)
@@ -600,7 +677,7 @@ if __name__ == "__main__":
 
         hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
         example_input = torch.randn(1, 1, hidden_size, dtype=model.dtype)
-        replace_rmsnorm_with_layer_norm(
+        replace_rmsnorm_with_rms_norm(
             gm, model.model.layers[0].input_layernorm, (example_input,)
         )
 
