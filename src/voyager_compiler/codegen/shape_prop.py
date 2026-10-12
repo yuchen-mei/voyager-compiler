@@ -4,29 +4,37 @@ from typing import Dict, List, Optional
 import torch
 from torch.fx.graph import map_arg
 from torch.fx.node import Node
+from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 logger = logging.getLogger(__name__)
 
 
 class ShapeProp:
-    """
-    Shape propagation. This class takes a `GraphModule`.
-    Then, its `propagate` method executes the `GraphModule`
-    node-by-node with the given arguments. As each operation
-    executes, the ShapeProp class stores away the shape and
-    element type for the output values of each operation on
-    the `shape` and `dtype` attributes of the operation's
-    `Node`.
+    """Execute a GraphModule to refresh compiler values and tensor metadata.
+
+    Export, transformation, tiling, and code generation call ``propagate`` with
+    real or fake inputs. Each node receives its current ``shape``, ``value``, and
+    existing execution ``tensor_meta``. Explicit ``meta['dtype']`` remains the
+    logical quantized representation, which can differ from the tensor's storage
+    dtype; export's fake ``meta['val']`` and other compiler annotations remain.
+    Unannotated nodes stay unannotated so fused placeholders still inherit their
+    source tensor's logical dtype instead of shadowing it with a storage dtype.
     """
 
     def __init__(self, mod, mode: Optional[FakeTensorMode] = None):
+        """Retain the graph/modules and optional fake mode for compiler passes."""
         self.mod = mod
         self.graph = mod.graph
         self.modules = dict(self.mod.named_modules())
         self._mode = mode
 
     def propagate(self, *args):
+        """Refresh every node from positional inputs and return the graph output.
+
+        Compiler passes supply flattened example inputs; an optional fake mode
+        avoids materializing graph intermediates while running the same operators.
+        """
         if self._mode is not None:
             with self._mode:
                 return self._propagate(*args)
@@ -34,6 +42,14 @@ class ShapeProp:
             return self._propagate(*args)
 
     def _propagate(self, *args):
+        """Execute nodes in order and refresh execution metadata in place.
+
+        Called only by ``propagate`` inside its selected execution mode. Existing
+        single-tensor metadata is refreshed without retaining tensor data. Remove
+        it for tuple/list and non-tensor results; their values and explicit logical
+        dtype annotations remain the compiler's source of element information.
+        Return the graph's output after releasing expired interpreter values.
+        """
         args_iter = iter(args)
         env : Dict[str, Node] = {}
 
@@ -95,6 +111,12 @@ class ShapeProp:
                 self.graph.print_tabular()
                 print(f"Error in node {node}")
                 raise
+
+            if isinstance(result, torch.Tensor):
+                if node.meta.get("tensor_meta") is not None:
+                    node.meta["tensor_meta"] = _extract_tensor_metadata(result)
+            else:
+                node.meta.pop("tensor_meta", None)
 
             if isinstance(result, torch.Tensor):
                 node.shape = result.shape

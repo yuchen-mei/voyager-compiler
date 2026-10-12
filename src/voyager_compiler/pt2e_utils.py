@@ -7,6 +7,7 @@ import torch
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.fx import GraphModule, Node
 from torch.fx.graph import map_arg
+from torch.fx.passes.shape_prop import _extract_tensor_metadata
 from accelerate.big_modeling import infer_auto_device_map
 from accelerate.utils import get_max_memory
 
@@ -77,6 +78,16 @@ def fetch_attr(module, target):
 
 
 def propagate_shape(node: Node, model: GraphModule = None):
+    """Refresh one rewritten node's value, shape, and execution tensor metadata.
+
+    Compiler graph-rewrite passes call this after inserting or changing a node.
+    Inputs come from each dependency's ``value`` or export's fake ``meta['val']``;
+    supply ``model`` when resolving attributes or submodules. Update the node in
+    place and return None. Refresh existing single-tensor ``tensor_meta``; remove
+    it for tuple/list and non-tensor results. Do not add it to unannotated nodes,
+    where it could shadow a source tensor's logical dtype. Preserve ``meta['val']``,
+    logical quantization ``meta['dtype']``, and other compiler annotations.
+    """
     def load_arg(a):
         return map_arg(a, lambda n: getattr(n, "value", n.meta.get("val")))
 
@@ -94,6 +105,12 @@ def propagate_shape(node: Node, model: GraphModule = None):
         result = modules[node.target](*load_arg(node.args), **load_arg(node.kwargs))
     elif node.op == 'output':
         result = load_arg(node.args[0])
+
+    if isinstance(result, torch.Tensor):
+        if node.meta.get("tensor_meta") is not None:
+            node.meta["tensor_meta"] = _extract_tensor_metadata(result)
+    else:
+        node.meta.pop("tensor_meta", None)
 
     if isinstance(result, torch.Tensor):
         node.shape = result.shape
