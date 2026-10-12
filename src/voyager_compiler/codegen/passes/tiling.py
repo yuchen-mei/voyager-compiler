@@ -841,46 +841,64 @@ def _make_tiled_linear_with_outlier_filter_module(
 
 
 def _gemm_output_residual_add(node):
-    """Return ``(add_node, residual_operand)`` for a residual add on ``node``'s
-    output, or ``None``.
+    """Return an eligible ``(add_node, residual)`` for C-tile seeding, or None.
 
-    Searches ``node``'s forward users for an ``aten.add.Tensor`` with two tensor
-    operands and returns it together with the operand not derived from ``node``.
-    Returns ``None`` if none is found or if the add's result feeds a quantize.
+    ``split_gemm_node`` and Agate's contraction cost model call this on a GEMM
+    after shape propagation. Accept only its sole, direct, unscaled tensor add,
+    with matching shapes/dtypes and a residual available before the GEMM. This
+    excludes branch-local bias, nonlinear paths, shared GEMM outputs, broadcasts,
+    dtype promotions, and forward references without changing the graph. Sparse
+    outlier GEMMs and adds feeding quantization retain their separate addition.
+
+    Seeding keeps one add per partial-sum stage so the existing fusion pattern
+    can absorb it. Floating addition is reassociated, including BF16 rounding;
+    like contraction tiling itself, this requires tolerance-based validation
+    rather than bitwise agreement with an add after the complete sum.
     """
+    if node.kwargs.get("A_data") is not None or len(node.users) != 1:
+        return None
+    add_node = next(iter(node.users))
+    if add_node.target != torch.ops.aten.add.Tensor or len(add_node.args) != 2:
+        return None
+    first, second = add_node.args
+    if not isinstance(first, Node) or not isinstance(second, Node) or first is second:
+        return None
+    if first is node:
+        residual = second
+    elif second is node:
+        residual = first
+    else:
+        return None
+    if add_node.kwargs.get("alpha", 1) != 1:
+        return None
 
-    def _from_node(candidate, depth=4):
-        cur = candidate
-        for _ in range(depth):
-            if cur is node:
-                return True
-            inputs = cur.all_input_nodes
-            if not inputs:
-                return False
-            cur = inputs[0]
-        return cur is node
-
-    seen = set()
-    frontier = list(node.users)
-    for _ in range(4):
-        following = []
-        for user in frontier:
-            if user in seen:
-                continue
-            seen.add(user)
-            if user.target == torch.ops.aten.add.Tensor:
-                operands = list(user.all_input_nodes)
-                residual = [op for op in operands if not _from_node(op)]
-                if len(operands) == 2 and len(residual) == 1:
-                    feeds_quantize = any(
-                        "quantize"
-                        in (getattr(c.target, "__name__", "") or str(c.target))
-                        for c in user.users
-                    )
-                    return None if feeds_quantize else (user, residual[0])
-            following.extend(user.users)
-        frontier = following
-    return None
+    values = [getattr(operand, "value", None) for operand in (node, residual, add_node)]
+    if not all(isinstance(value, torch.Tensor) for value in values):
+        return None
+    if any(
+        value.shape != values[0].shape or value.dtype != values[0].dtype
+        for value in values[1:]
+    ):
+        return None
+    # Quantized tensors can be emulated in floating storage, so match their
+    # declared dtype as well as the shape-propagated tensor dtype.
+    dtypes = [
+        str(operand.meta.get("dtype") or value.dtype).removeprefix("torch.")
+        for operand, value in zip((node, residual, add_node), values)
+    ]
+    if dtypes[1:] != [dtypes[0], dtypes[0]]:
+        return None
+    for preceding in node.graph.nodes:
+        if preceding is residual:
+            break
+        if preceding is node:
+            return None
+    if any(
+        "quantize" in (getattr(user.target, "__name__", "") or str(user.target))
+        for user in add_node.users
+    ):
+        return None
+    return add_node, residual
 
 
 def _seed_reduction_with_residual(model, gm, value_remap, residual_info):
