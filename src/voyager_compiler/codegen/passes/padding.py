@@ -1,4 +1,5 @@
 import logging
+import math
 import operator
 from typing import List
 
@@ -337,25 +338,54 @@ def pad_layer_norm_to_hardware_unroll_size(
     model.graph.erase_node(node)
 
 
-def pad_calculate_mx_qparam(model, node, unroll):
-    input, axes, bs = node.args[:3]
+def pad_microscaling_op(model, node, unroll):
+    """Align a dynamic MX operation and restore each output's logical shape.
+
+    ``pad_vector_op_dimensions`` calls this with a shape-annotated FX graph,
+    either a legacy ``calculate_mx_qparam`` node or a tuple-returning
+    ``quantize_mx`` node, and the hardware's last-dimension lane count.
+    Legacy quantize consumers share the padded input and scale; fused outputs
+    are selected by getitem nodes, as emitted by PT2E conversion. Other users
+    retain the original scale/value shapes and logical dtypes through slices.
+
+    Adapted from upstream 27d90f5 without removing the legacy operator or
+    changing its protobuf representation. Alignment satisfies both MX blocks
+    and hardware lanes, and dependent slices are inserted and propagated in
+    order. Mutates the graph and cached node values in place; the caller owns
+    final graph linting, dead-code removal, and recompilation. Returns None.
+    """
+    input = node.args[0]
+    quantize_nodes = []
+    if node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
+        axes = get_arg_value(node, 1, "axes")
+        block_size = get_arg_value(node, 2, "block_size")
+        quantize_nodes = [
+            user
+            for user in node.users
+            if user.target == torch.ops.quantized_ops.quantize.default
+        ]
+        outputs = [node, *quantize_nodes]
+    else:
+        axes = get_arg_value(node, 2, "axes")
+        block_size = get_arg_value(node, 3, "block_size")
+        outputs = list(node.users)
     ndim = len(input.shape)
+    axes = {axis % ndim for axis in axes}
 
     pad_dims = {}
-
-    orig_k = input.shape[-1]
-    if orig_k % unroll != 0:
-        pad_dims[ndim - 1] = (-orig_k) % unroll
-
-    for axis in axes:
-        size = input.shape[axis]
-        if size % bs != 0:
-            pad_dims[axis % ndim] = (bs - (size % bs)) % bs
+    for dim, size in enumerate(input.shape):
+        multiple = unroll if dim == ndim - 1 else 1
+        if dim in axes:
+            multiple = math.lcm(multiple, block_size)
+        if size % multiple:
+            pad_dims[dim] = (-size) % multiple
 
     if not pad_dims:
         return
 
-    logger.info(f"Padding calculate_mx_qparams {node} with {pad_dims}")
+    logger.info(f"[INFO] Padding microscaling operation {node} with {pad_dims}")
+    original_shapes = {output: tuple(output.shape) for output in outputs}
+    original_users = {output: list(output.users) for output in outputs}
 
     min_pad_dim = min(pad_dims.keys())
     pad_tuple = []
@@ -373,28 +403,31 @@ def pad_calculate_mx_qparam(model, node, unroll):
     node.replace_input_with(input, new_input)
 
     propagate_shape(node)
+    for quantize_node in quantize_nodes:
+        quantize_node.replace_input_with(input, new_input)
 
-    def slice_node(n):
-        with model.graph.inserting_after(n.next):
-            for dim in pad_dims.keys():
-                n = model.graph.call_function(
-                    torch.ops.aten.slice.Tensor, (n, dim, 0, input.shape[dim]),
-                )
-            propagate_shape(n)
-            n.meta["dtype"] = node.meta.get("dtype")
-        return n
-
-    scale_node = slice_node(node)
-
-    for user in list(node.users):
-        if user.target == torch.ops.quantized_ops.quantize.default:
-            users = list(user.users)
-            new_q_node = slice_node(user)
-            for u in users:
-                u.replace_input_with(user, new_q_node)
-            user.replace_input_with(input, new_input)
-        elif user != scale_node:
-            user.replace_input_with(node, scale_node)
+    # Scale axes count blocks, while quantized-value axes count elements.
+    # Slice only dimensions that actually grew for the particular output.
+    for output in outputs:
+        if output is not node:
+            propagate_shape(output)
+        sliced = output
+        for dim, original_size in enumerate(original_shapes[output]):
+            if output.shape[dim] != original_size:
+                with model.graph.inserting_after(sliced):
+                    sliced = model.graph.call_function(
+                        torch.ops.aten.slice.Tensor,
+                        (sliced, dim, 0, original_size),
+                    )
+                propagate_shape(sliced)
+                sliced.meta["dtype"] = output.meta.get("dtype")
+        if sliced is not output:
+            for user in original_users[output]:
+                # Legacy quantizers need the full padded scale until their
+                # own output is sliced; unrelated scale users keep its shape.
+                if output is node and user in quantize_nodes:
+                    continue
+                user.replace_input_with(output, sliced)
 
 
 def pad_vector_op_dimensions(
@@ -402,8 +435,11 @@ def pad_vector_op_dimensions(
     K_unroll,
 ) -> GraphModule:
     """
-    Pad inputs to vector operations to multiples of the hardware unroll size.
-    Only support softmax operation for now.
+    Pad norm, softmax, and MX inputs to the hardware vector width.
+
+    Called by ``transform`` after initial shape propagation. MX quantization
+    additionally aligns each reduction axis to complete quantization blocks.
+    Mutates the graph, restores logical output shapes, and recompiles it.
 
     Parameters:
         model (torch.fx.GraphModule): The FX graph module to transform.
@@ -417,8 +453,11 @@ def pad_vector_op_dimensions(
             pad_layer_norm_to_hardware_unroll_size(model, node, K_unroll)
             continue
 
-        if node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
-            pad_calculate_mx_qparam(model, node, K_unroll)
+        if node.target in (
+            torch.ops.quantized_ops.calculate_mx_qparam.default,
+            torch.ops.quantized_ops.quantize_mx.default,
+        ):
+            pad_microscaling_op(model, node, K_unroll)
             continue
 
         if node.target != torch.ops.aten.softmax.int:
@@ -446,7 +485,8 @@ def pad_vector_op_dimensions(
 
         with model.graph.inserting_after(node):
             slice_node = model.graph.call_function(
-                torch.ops.aten.slice.Tensor, (node, -1, 0, reduction_dim),
+                torch.ops.aten.slice.Tensor,
+                (node, -1, 0, reduction_dim),
             )
 
         node.replace_all_uses_with(slice_node)
