@@ -465,6 +465,13 @@ def calculate_mx_qparam(
     force_scale_power_of_two: bool = False,
     scale_qmap: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Return per-block scales for fake and converted MX quantization.
+
+    Tile input along axes with block_size and scale each block for quant_max.
+    The power-of-two path produces E8M0 scales, including its minimum exponent;
+    otherwise scale_qmap optionally rounds the amax-derived scales. The returned
+    tensor keeps input's dtype and has one scale per padded quantization block.
+    """
     assert block_size > 0
 
     # Make sure axes is a list of non-negative numbers
@@ -487,6 +494,11 @@ def calculate_mx_qparam(
         # Offset the max exponent by the largest representable exponent
         # in the element data format
         shared_exp = shared_exp - math.floor(math.log2(quant_max))
+
+        # E8M0 cannot encode exponents below -127. In particular, a zero
+        # INT8 block otherwise gets 2**-132, a positive BF16 subnormal that
+        # bypasses the scale > 0 fallback below. Zero payloads remain zero.
+        shared_exp = torch.clamp(shared_exp, min=-127)
 
         for axis in reversed(axes):
             # Remove extra dimension
