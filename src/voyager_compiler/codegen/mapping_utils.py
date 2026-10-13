@@ -50,13 +50,19 @@ def _save_tensor(tensor: torch.Tensor, filename: str):
     _executor.submit(_write_numpy, np_array, filename, tuple(t.shape))
 
 
-def save_tensor(tensor, filename):
-    """
-    Save the tensor to a file using the custom save function if defined,
-    otherwise use the default _save_tensor function.
+def save_tensor(tensor, filename, *, synchronous=False):
+    """Write an emitted tensor with the registered saver or float32 encoding.
+
+    Field serializers use the existing asynchronous default. Streaming graph
+    execution requests synchronous writes so queued arrays cannot retain dead
+    activations or observe later in-place mutations. Custom savers receive an
+    independent CPU snapshot during streaming, as with retained graph values;
+    their completion policy remains their own.
     """
     if _custom_save_function is not None:
-        _custom_save_function(tensor, filename)
+        _custom_save_function(tensor.cpu().clone() if synchronous else tensor, filename)
+    elif synchronous:
+        tensor.detach().cpu().contiguous().to(torch.float32).numpy().tofile(filename)
     else:
         _save_tensor(tensor, filename)
 
@@ -77,7 +83,14 @@ def _set_meminfo(field, segment):
     field.address = int(segment.start)
 
 
-def set_tensor_field(field, node, output_dir=None, is_output=False):
+def set_tensor_field(field, node, output_dir=None, is_output=False, tensor_files=None):
+    """Populate a protobuf tensor field from physical and logical node metadata.
+
+    Input/output serializers call this with an FX node. Resolve fused aliases
+    and source nodes before recording its name, layout, and logical dtype.
+    ``output_dir`` retains immediate saving; ``tensor_files`` instead collects
+    resolved tensor names for gen_code's later streaming execution.
+    """
     if not isinstance(node, Node) or not hasattr(node, 'value'):
         raise TypeError(f"Expected node with value attribute, got {node!r}")
 
@@ -116,14 +129,22 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
 
     if output_dir is not None:
         save_tensor(node.value, os.path.join(output_dir, f"{node.name}.bin"))
+    if tensor_files is not None:
+        tensor_files.add(node.name)
 
 
-def set_output_field(param, node, output_dir):
+def set_output_field(param, node, output_dir, tensor_files=None):
+    """Record a node's tensor or tuple result in an Operation protobuf.
+
+    Code emission supplies the annotated node and either an immediate dump
+    directory or a set collecting exact dump names for streaming execution.
+    Tuple elements retain their individual logical dtypes and memory offsets.
+    """
     if isinstance(node.value, torch.Tensor):
         node.meta["_tiled_shapes"] = node.meta.get("tiled_shapes")
         node.meta["_scratchpad_map"] = node.meta.get("scratchpad_map")
 
-        set_tensor_field(param.output, node, output_dir, True)
+        set_tensor_field(param.output, node, output_dir, True, tensor_files)
 
         node.meta.pop("_tiled_shapes", None)
         node.meta.pop("_scratchpad_map", None)
@@ -162,6 +183,8 @@ def set_output_field(param, node, output_dir):
 
             if output_dir is not None:
                 save_tensor(t, os.path.join(output_dir, f"{node.name}_{i}.bin"))
+            if tensor_files is not None:
+                tensor_files.add(f"{node.name}_{i}")
 
             param.outputs.tensors.append(tensor)
     else:

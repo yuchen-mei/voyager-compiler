@@ -1,13 +1,16 @@
 import logging
 import re
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Dict, Tuple, Callable, Any, Union, List
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.fx import GraphModule, Node
 from torch.fx.graph import map_arg
 from torch.fx.passes.shape_prop import _extract_tensor_metadata
+from torch.utils._pytree import tree_leaves
 from accelerate.big_modeling import infer_auto_device_map
 from accelerate.utils import get_max_memory
 
@@ -15,6 +18,10 @@ from .quantize_pt2e import export_model
 
 
 logger = logging.getLogger(__name__)
+
+# Reuse one mode across lowering and memory mapping so fake activations can
+# meet real weights or fake values produced by another compiler pass.
+FAKE_MODE = FakeTensorMode(allow_non_fake_inputs=True)
 
 
 __all__ = [
@@ -87,6 +94,9 @@ def propagate_shape(node: Node, model: GraphModule = None):
     it for tuple/list and non-tensor results. Do not add it to unannotated nodes,
     where it could shadow a source tensor's logical dtype. Preserve ``meta['val']``,
     logical quantization ``meta['dtype']``, and other compiler annotations.
+    Fake operands dispatch without allocating storage. In a graph with fake
+    placeholder values, tensor-free generators also run in that mode; operations
+    on real parameters remain real so quantization can inspect their contents.
     """
     def load_arg(a):
         return map_arg(a, lambda n: getattr(n, "value", n.meta.get("val")))
@@ -95,14 +105,31 @@ def propagate_shape(node: Node, model: GraphModule = None):
 
     if node.op == 'get_attr':
         result = fetch_attr(model, node.target)
-    elif node.op == 'call_function':
-        result = node.target(*load_arg(node.args), **load_arg(node.kwargs))
-    elif node.op == 'call_method':
-        self_obj, *args = load_arg(node.args)
-        kwargs = load_arg(node.kwargs)
-        result = getattr(self_obj, node.target)(*args, **kwargs)
-    elif node.op == 'call_module':
-        result = modules[node.target](*load_arg(node.args), **load_arg(node.kwargs))
+    elif node.op in ('call_function', 'call_method', 'call_module'):
+        args, kwargs = load_arg(node.args), load_arg(node.kwargs)
+        tensor_inputs = [
+            x for x in tree_leaves((args, kwargs)) if isinstance(x, torch.Tensor)
+        ]
+        factory_mode = None
+        if not tensor_inputs:
+            factory_mode = next((
+                value.fake_mode
+                for placeholder in node.graph.nodes
+                if placeholder.op == 'placeholder'
+                for value in tree_leaves(
+                    getattr(placeholder, 'value', placeholder.meta.get('val'))
+                )
+                if isinstance(value, FakeTensor)
+            ), None)
+        if node.op == 'call_function':
+            target = node.target
+        elif node.op == 'call_method':
+            self_obj, *args = args
+            target = getattr(self_obj, node.target)
+        else:
+            target = modules[node.target]
+        with factory_mode if factory_mode is not None else nullcontext():
+            result = target(*args, **kwargs)
     elif node.op == 'output':
         result = load_arg(node.args[0])
 
@@ -114,10 +141,15 @@ def propagate_shape(node: Node, model: GraphModule = None):
 
     if isinstance(result, torch.Tensor):
         node.shape = result.shape
-        node.value = result.cpu().clone()
+        node.value = result if isinstance(result, FakeTensor) else result.cpu().clone()
     elif isinstance(result, (tuple, list)):
-        node.shape = tuple(x.shape for x in result)
-        node.value = tuple(x.cpu().clone() for x in result)
+        node.shape = tuple(x.shape if isinstance(x, torch.Tensor) else None for x in result)
+        node.value = tuple(
+            x.cpu().clone()
+            if isinstance(x, torch.Tensor) and not isinstance(x, FakeTensor)
+            else x
+            for x in result
+        )
     else:
         node.value = result
 

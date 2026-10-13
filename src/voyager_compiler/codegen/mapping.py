@@ -37,6 +37,7 @@ from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
 from ..pt2e_utils import (
+    FAKE_MODE,
     dtype_byte_size,
     fetch_attr,
     propagate_shape,
@@ -820,17 +821,23 @@ def get_node_bytes(n: Node):
 
 
 def get_tiled_tensor(arg, tiled_shapes=None):
+    """Return an independent operand tile for mapping's subgraph propagation.
+
+    ``arg`` is an FX tensor node or an unchanged scalar argument. Slice before
+    cloning so a small tile of a real weight does not copy the full allocation.
+    Fake operands retain their storage-free shape semantics.
+    """
     if not isinstance(arg, torch.fx.Node):
         return arg
 
     if tiled_shapes is None or arg not in tiled_shapes:
         return arg.value.clone()
 
-    tensor = arg.value.clone()
+    tensor = arg.value
     shape = tiled_shapes[arg]
     n = len(shape)
     slices = [slice(None)] * (tensor.ndim - n) + [slice(0, s) for s in shape]
-    return tensor[tuple(slices)]
+    return tensor[tuple(slices)].clone()
 
 
 def get_node_to_key_map(node):
@@ -1066,8 +1073,16 @@ def run_memory_mapping(
     cache_size: int = None,
     num_banks: int = None,
     bank_width: int = None,
-    unroll_dims=None
+    unroll_dims=None,
+    capture_snapshots=True,
 ):
+    """Assign legacy DRAM/scratchpad locations using propagated node metadata.
+
+    ``compile`` supplies an allocator and hardware tiling options. Its normal
+    path disables ``capture_snapshots``; direct callers retain the historical
+    default for allocator visualization. Mapping updates graph annotations and
+    may insert copy nodes, propagating their real or fake operand values.
+    """
     graph = model.graph
     named_modules = dict(model.named_modules(remove_duplicate=False))
 
@@ -1087,7 +1102,8 @@ def run_memory_mapping(
         if node.op == "placeholder":
             node.meta["memory"] = allocator.allocate_memory(node)
 
-    allocator.snapshot()
+    if capture_snapshots:
+        allocator.snapshot()
 
     def is_impure_node(n):
         return n.op in ['placeholder', 'output']
@@ -1382,7 +1398,8 @@ def run_memory_mapping(
 
         if node.meta.get("memory") is None:
             node.meta["memory"] = allocator.allocate_memory(node)
-            allocator.snapshot()
+            if capture_snapshots:
+                allocator.snapshot()
 
         for n in get_unused_values(node):
             allocator.free_memory(n)
@@ -1394,14 +1411,26 @@ def run_memory_mapping(
     model.recompile()
 
 
-def gen_code(model, args, output_dir=None):
+@torch.no_grad()
+def gen_code(model, args, output_dir=None, use_fake_mode=True):
+    """Build legacy protobuf fields, then stream any requested real tensors.
+
+    ``compile`` calls this after memory mapping with real example inputs. Dense
+    metadata emission uses fake activations, including fused full-size/tiled
+    subgraphs. Sparse callers can retain real propagation via ``use_fake_mode``.
+    Resolve exact dump names while emitting fields, then execute real inputs
+    once with bounded value retention. Return the protobuf with unchanged names,
+    logical dtypes, layouts, and memory annotations.
+    """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
     named_modules = dict(model.named_modules(remove_duplicate=False))
 
-    ShapeProp(model).propagate(*args)
+    fake_mode = FAKE_MODE if use_fake_mode else None
+    ShapeProp(model, mode=fake_mode).propagate(*args)
     model_params = Model()
+    tensor_files = set() if output_dir is not None else None
 
     for node in model.graph.nodes:
         if not isinstance(node.value, (torch.Tensor, tuple, list)):
@@ -1411,12 +1440,12 @@ def gen_code(model, args, output_dir=None):
 
         if node.op == 'placeholder':
             tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir)
+            set_tensor_field(tensor, node, tensor_files=tensor_files)
             model_params.inputs.append(tensor)
             continue
         elif node.op == 'get_attr':
             tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir)
+            set_tensor_field(tensor, node, tensor_files=tensor_files)
             if "memory" in node.meta:
                 model_params.parameters.append(tensor)
             continue
@@ -1427,15 +1456,18 @@ def gen_code(model, args, output_dir=None):
             assert isinstance(gm, torch.fx.GraphModule)
 
             if (tiled_shapes := node.meta.get('tiled_shapes')):
-                args = map_arg(node.args, lambda n: get_tiled_tensor(n, tiled_shapes))
-                ShapeProp(gm).propagate(*args)
+                tile_args = map_arg(node.args, lambda n: get_tiled_tensor(n, tiled_shapes))
+                ShapeProp(gm, mode=fake_mode).propagate(*tile_args)
 
                 for n in gm.graph.nodes:
                     if hasattr(n, "shape"):
                         tiled_shapes.setdefault(n, n.shape)
 
-            args = map_arg(node.args, lambda n: n.value.clone())
-            ShapeProp(gm).propagate(*args)
+            # Real fused operators may mutate their inputs; preserve parent snapshots.
+            subgraph_args = map_arg(
+                node.args, lambda n: n.value.clone() if fake_mode is None else n.value
+            )
+            ShapeProp(gm, mode=fake_mode).propagate(*subgraph_args)
 
             operators = []
             for n in gm.graph.nodes:
@@ -1453,9 +1485,14 @@ def gen_code(model, args, output_dir=None):
         else:
             continue
 
-        set_output_field(op, node, output_dir)
+        set_output_field(op, node, None, tensor_files=tensor_files)
 
         model_params.ops.append(op)
+
+    if tensor_files is not None:
+        ShapeProp(model, tensor_files={
+            name: os.path.join(output_dir, f"{name}.bin") for name in tensor_files
+        }).propagate(*args)
 
     return model_params
 

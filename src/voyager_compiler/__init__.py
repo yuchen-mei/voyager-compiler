@@ -1,5 +1,4 @@
 from google.protobuf import text_format
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._pytree import tree_flatten
 
 from .codegen import *
@@ -11,6 +10,7 @@ from .llm_utils import *
 from .normal_float import *
 from .posit import *
 from .pt2e_utils import *
+from .pt2e_utils import FAKE_MODE
 from .qconfig import *
 from .quantize import *
 from .quantize_pt2e import *
@@ -136,10 +136,28 @@ def transform(
     use_fake_mode=True,
     pad_terminal_output=True,
 ):
+    """Lower a calibrated graph while retaining real sparse capacity analysis.
+
+    Model frontends pass their example inputs and layout/tiling options here.
+    Dense activation shapes use fake tensors; parameters and codebooks remain
+    real. Legacy sparse tiling reads CSR contents, so sparse graphs keep their
+    existing real propagation even when ``use_fake_mode`` is requested.
+    """
     if example_kwargs is None:
         example_kwargs = {}
 
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True) if use_fake_mode else None
+    has_sparse = any(
+        node.target in (
+            torch.ops.quantized_ops.quantize_mx_outlier.default,
+            torch.ops.quantized_ops.filter_outlier.default,
+            torch.ops.quantized_ops.slice_csr_tensor.default,
+            torch.ops.quantized_ops.spmm_csr.default,
+        ) or node.kwargs.get("A_indptr") is not None
+        or node.kwargs.get("A_data") is not None
+        for module in model.modules() if isinstance(module, torch.fx.GraphModule)
+        for node in module.graph.nodes
+    )
+    fake_mode = FAKE_MODE if use_fake_mode and not has_sparse else None
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
@@ -230,6 +248,7 @@ def transform(
     return model
 
 
+@torch.no_grad()
 def compile(
     model: torch.fx.GraphModule,
     example_args,
@@ -243,15 +262,37 @@ def compile(
     output_file="compute_graph",
     dump_tensors=True,
     dump_snapshot=False,
+    use_fake_mode=True,
 ):
+    """Emit the legacy protobuf using shape-only dense memory planning.
+
+    Frontends supply a lowered graph and real example inputs. Sparse graphs keep
+    real CSR capacity analysis; dense graphs propagate fake activations through
+    allocation. Code emission materializes requested tensor files in a bounded
+    real execution. Allocator history is retained only for ``dump_snapshot``.
+    Return the emitted Model protobuf and write the existing output artifacts.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*flatten_args)
+    has_sparse = any(
+        node.target in (
+            torch.ops.quantized_ops.quantize_mx_outlier.default,
+            torch.ops.quantized_ops.filter_outlier.default,
+            torch.ops.quantized_ops.slice_csr_tensor.default,
+            torch.ops.quantized_ops.spmm_csr.default,
+        ) or node.kwargs.get("A_indptr") is not None
+        or node.kwargs.get("A_data") is not None
+        for module in model.modules() if isinstance(module, torch.fx.GraphModule)
+        for node in module.graph.nodes
+    )
+    use_fake_mode = use_fake_mode and not has_sparse
+    ShapeProp(model, mode=FAKE_MODE if use_fake_mode else None).propagate(*flatten_args)
 
     allocator = MemoryAllocator(total_memory, bank_width=bank_width)
     run_memory_mapping(
-        model, allocator, cache_size, num_banks, bank_width, unroll_dims
+        model, allocator, cache_size, num_banks, bank_width, unroll_dims,
+        capture_snapshots=dump_snapshot,
     )
 
     # Experimental feature
@@ -270,7 +311,10 @@ def compile(
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))
 
     path = os.path.join(output_dir, "tensor_files")
-    params = gen_code(model, flatten_args, path if dump_tensors else None)
+    params = gen_code(
+        model, flatten_args, path if dump_tensors else None,
+        use_fake_mode=use_fake_mode,
+    )
 
     with open(os.path.join(output_dir, 'model.txt'), "w") as f:
         f.write(text_format.MessageToString(params))
