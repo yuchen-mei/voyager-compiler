@@ -848,7 +848,8 @@ def _gemm_output_residual_add(node):
     with matching shapes/dtypes and a residual available before the GEMM. This
     excludes branch-local bias, nonlinear paths, shared GEMM outputs, broadcasts,
     dtype promotions, and forward references without changing the graph. Sparse
-    outlier GEMMs and adds feeding quantization retain their separate addition.
+    outlier GEMMs retain their separate addition. Quantization consumers remain
+    after the completed reduction; they do not prevent residual seeding.
 
     Seeding keeps one add per partial-sum stage so the existing fusion pattern
     can absorb it. Floating addition is reassociated, including BF16 rounding;
@@ -893,11 +894,6 @@ def _gemm_output_residual_add(node):
             break
         if preceding is node:
             return None
-    if any(
-        "quantize" in (getattr(user.target, "__name__", "") or str(user.target))
-        for user in add_node.users
-    ):
-        return None
     return add_node, residual
 
 
