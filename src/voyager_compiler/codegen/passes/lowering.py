@@ -40,6 +40,18 @@ __all__ = [
 ]
 
 
+def _broadcast_batch_index(tensor: torch.Tensor, idx: tuple) -> tuple:
+    """Return the index into tensor's batch axes for broadcast batch index idx.
+
+    idx indexes the broadcast batch shape of a matmul (all axes but the last
+    two). Batch axes are right-aligned: axes idx has but tensor lacks are
+    dropped, and a size-one axis of tensor is read at 0 regardless of idx.
+    """
+    batch = tensor.shape[:-2]
+    offset = len(idx) - len(batch)
+    return tuple(0 if dim == 1 else i for i, dim in zip(idx[offset:], batch))
+
+
 def _decompose_bmm(model: GraphModule, node: Node):
     input1 = node.args[0].value
     input2 = node.args[1].value
@@ -51,11 +63,14 @@ def _decompose_bmm(model: GraphModule, node: Node):
 
     class BMM(torch.nn.Module):
         def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            # Loop through each element in the batch dimensions
-            batch_shape = x.shape[:-2]
+            # Loop through each element in the (broadcast) batch dimensions
+            batch_shape = torch.broadcast_shapes(x.shape[:-2], y.shape[:-2])
             result = []
             for idx in itertools.product(*[range(dim) for dim in batch_shape]):
-                result.append(torch.matmul(x[idx], y[idx]))
+                result.append(torch.matmul(
+                    x[_broadcast_batch_index(x, idx)],
+                    y[_broadcast_batch_index(y, idx)],
+                ))
             result = torch.stack(result)
             result = result.view(*batch_shape, *result.shape[-2:])
             return result
@@ -96,13 +111,18 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
                 self, input: torch.Tensor, other: torch.Tensor, input_scale=None,
                 weight_scale=None, input_code=None, weight_code=None, A_data=None,
                 A_indices=None, A_indptr=None, weight_transposed=False):
-            # Loop through each element in the batch dimensions
-            batch_shape = input.shape[:-2]
+            # Loop through each element in the (broadcast) batch dimensions.
+            # A size-one batch axis of either operand (for example a key/value
+            # head shared by several query heads) is read at index 0 for every
+            # output batch element, so no expanded copy of that operand exists.
+            batch_shape = torch.broadcast_shapes(input.shape[:-2], other.shape[:-2])
             result = []
             for idx in itertools.product(*[range(dim) for dim in batch_shape]):
+                input_idx = _broadcast_batch_index(input, idx)
+                other_idx = _broadcast_batch_index(other, idx)
                 kwargs = {
-                    "input_scale": input_scale[idx],
-                    "weight_scale": weight_scale[idx],
+                    "input_scale": input_scale[input_idx],
+                    "weight_scale": weight_scale[other_idx],
                     "block_size": block_size,
                     "input_code": input_code,
                     "weight_code": weight_code,
@@ -115,7 +135,7 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
                         "weight_transposed": weight_transposed,
                     })
                 result.append(torch.ops.quantized_ops.matmul_mx(
-                    input[idx], other[idx], **kwargs,
+                    input[input_idx], other[other_idx], **kwargs,
                 ))
             result = torch.stack(result)
             result = result.view(*batch_shape, *result.shape[-2:])
