@@ -32,6 +32,7 @@ __all__ = [
 ]
 
 TRANSPOSED_OPERATORS = {
+    torch.ops.aten.conv1d.default: torch.ops.quantized_ops.conv1d.default,
     torch.ops.aten.conv2d.default: torch.ops.quantized_ops.conv2d.default,
     torch.ops.aten.max_pool2d.default: torch.ops.quantized_ops.max_pool2d.default,
     torch.ops.aten.adaptive_avg_pool2d.default: torch.ops.quantized_ops.adaptive_avg_pool2d.default,
@@ -45,6 +46,7 @@ AXES_ARG_INDEX_MAP = {
     torch.ops.quantized_ops.quantize_mx.default: 2,
 }
 
+NCL_TO_NLC = (0, 2, 1)
 NCHW_TO_NHWC = (0, 2, 3, 1)
 NHWC_TO_NCHW = (0, 3, 1, 2)
 WEIGHT_NCHW_TO_HWIO = (2, 3, 1, 0)
@@ -77,8 +79,12 @@ def extract_conv2d_graph(
     """
     Depth-first worklist traversal over both consumers (users) and
     producers (input nodes), restricted to reshape/elementwise/transpose
-    /indexing/quantization ops that are considered fusable.
+    /indexing/quantization ops that are considered fusable. Conv1D uses the
+    same traversal to choose rank-three starting groups. Its separate forward
+    pass then tracks rank changes and permutations beyond these groups. Keep
+    convolution parameter paths out of the activation-layout traversal.
     """
+    channel_last_1d = start.target == torch.ops.aten.conv1d.default
     quantized_lib = torch.ops.quantized_ops
 
     ALLOW_LIST_OPS = {
@@ -88,6 +94,23 @@ def extract_conv2d_graph(
     }
 
     def should_traverse(node: Node) -> bool:
+        # Keep rank-changing operations and Conv1D layout boundaries outside.
+        if channel_last_1d:
+            return len(getattr(node, "shape", ())) == 3 and (
+                node.target in (
+                    torch.ops.aten.conv1d.default,
+                    torch.ops.aten.slice.Tensor,
+                    torch.ops.aten.cat.default,
+                    torch.ops.aten._to_copy.default,
+                    torch.ops.aten.to.dtype,
+                    torch.ops.aten.clone.default,
+                    torch.ops.aten.contiguous.default,
+                    torch.ops.aten.detach.default,
+                )
+                or node.target in ALLOW_LIST_OPS
+                or is_elementwise_op(node)
+            )
+
         # Cannot fuse stack because it creates a new dimension
         if node.target == torch.ops.aten.stack.default:
             return False
@@ -119,9 +142,17 @@ def extract_conv2d_graph(
         visited.add(node)
         nodes_in_graph.add(node)
 
-        adjacent_nodes = list(node.users) + list(node.all_input_nodes)
+        inputs = node.all_input_nodes
+        if channel_last_1d and node.target == torch.ops.aten.conv1d.default:
+            inputs = [node.args[0]]
+        adjacent_nodes = list(node.users) + list(inputs)
 
         for n in adjacent_nodes:
+            if (
+                channel_last_1d and n.target == torch.ops.aten.conv1d.default
+                and n.args[0] is not node
+            ):
+                continue
             if n not in visited and should_traverse(n):
                 stack.append(n)
 
@@ -189,6 +220,12 @@ def _get_path_to_conv2d(node: torch.fx.Node):
 def _process_conv2d_input_nodes(
     node: Node, model: GraphModule, island_set: Set[Node]
 ):
+    """Convert a Conv2D group's external input, leaving other users unchanged.
+
+    The convolution layout pass calls this for incoming parameters and tensors.
+    Standard convolution weights use HWIO; eligible activations use NHWC.
+    Depthwise parameters retain their existing interpretation.
+    """
     graph = model.graph
     path = _get_path_to_conv2d(node)
 
@@ -227,8 +264,19 @@ def _process_conv2d_input_nodes(
                 user.replace_input_with(node, permute_node)
 
 
-def _rewrite_node_args_for_layout(node: Node) -> None:
-    input_dims = node.all_input_nodes[0].meta.get("dims")
+def _rewrite_node_args_for_layout(node: Node, input_dims=None) -> None:
+    """Update one island node's axis arguments and operator for its input layout.
+
+    The layout pass calls this in graph order after converting incoming edges.
+    Conv1D supplies its per-node input permutation explicitly; Conv2D infers it
+    from incoming edges. A scalar first operand has no layout; use the next
+    tensor operand in that case. Preserve quantization meaning by remapping its
+    axes with slice axes, including default and keyword axis arguments.
+    """
+    if input_dims is None:
+        input_dims = next(
+            (n.meta["dims"] for n in node.all_input_nodes if "dims" in n.meta), None
+        )
     node.meta["dims"] = input_dims
 
     args = tuple(node.args)
@@ -241,7 +289,10 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
         dim = get_arg_value(node, 1, "dim", 0)
         if dim < 0:
             dim = dim + len(input_dims)
-        node.update_arg(1, input_dims.index(dim))
+        if len(node.args) > 1:
+            node.update_arg(1, input_dims.index(dim))
+        else:
+            node.update_kwarg("dim", input_dims.index(dim))
 
     if is_reshape_op(node):
         if node.target == torch.ops.aten.transpose.int:
@@ -253,19 +304,293 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
         node.update_arg(1, dims)
 
     idx = AXES_ARG_INDEX_MAP.get(node.target)
-    if idx is not None and idx < len(args) and args[idx] is not None:
-        axes = [a + len(input_dims) if a < 0 else a for a in args[idx]]
+    axes = get_arg_value(node, idx, "axes") if idx is not None else None
+    if axes is not None:
+        axes = [a + len(input_dims) if a < 0 else a for a in axes]
         axes = tuple(input_dims.index(a) for a in axes)
-        node.update_arg(idx, axes)
+        if idx < len(args):
+            node.update_arg(idx, axes)
+        else:
+            node.update_kwarg("axes", axes)
 
     if node.target in TRANSPOSED_OPERATORS:
         node.target = TRANSPOSED_OPERATORS[node.target]
         node.meta["transposed"] = True
 
 
-def transpose_conv2d_inputs_and_weights(model: GraphModule):
+def transpose_conv1d_activations(model: GraphModule):
+    """Keep Conv1D activations channel-last through supported tensor operations.
+
+    The convolution layout pass calls this after shape propagation. Existing
+    rank-three convolution groups seed NCL-to-NLC conversion; downstream nodes
+    carry their own physical-to-original axis permutation, even after axes are
+    added or removed. Multi-output operators record one permutation per tensor.
+    Each input edge is aligned separately, preserving broadcasting, parameters,
+    lookup tables, and consumers outside the converted graph. Unsupported
+    operations and model outputs receive their original axis order.
+
+    Only transpose/permute nodes become temporary aliases: their complete effect
+    is carried in the output permutation and materialized at boundaries when
+    needed. Slice, concatenation, casts, and quantization retain their operations.
+    Arbitrary reshapes remain boundaries because they can change element order.
+    Return the processed nodes, including boundary conversions, so the following
+    Conv2D traversal treats their restored outputs as new external inputs.
+    """
     graph = model.graph
-    visited_nodes: Set[Node] = set()
+    nodes = list(graph.nodes)
+    seeds = set()
+    for node in nodes:
+        if node.target == torch.ops.aten.conv1d.default and node not in seeds:
+            extract_conv2d_graph(model, node, seeds)
+    if not seeds:
+        return set()
+
+    aten, quantized = torch.ops.aten, torch.ops.quantized_ops
+    copies = (aten._to_copy.default, aten.to.dtype, aten.clone.default,
+              aten.contiguous.default, aten.detach.default)
+    squeezes = (aten.squeeze.default, aten.squeeze.dim, aten.squeeze.dims)
+    splits = (aten.split.Tensor, aten.split_with_sizes.default, aten.chunk.default)
+    quantization = (quantized.quantize.default, quantized.dequantize.default)
+    data_only = (aten.conv1d.default, quantized.calculate_mx_qparam.default,
+                 quantized.quantize_mx.default, quantized.vmap.default)
+    layouts, output_layouts = {}, {}
+    converted, aliases = set(), []
+    layout_required = set()
+    for node in reversed(nodes):
+        if (node.target == aten.conv1d.default or is_reshape_op(node)
+                or any(user in layout_required for user in node.users)):
+            layout_required.add(node)
+
+    for node in nodes:
+        target = node.target
+        if (target == operator.getitem and node.args[0] in output_layouts
+                and isinstance(node.args[1], int)):
+            dims = output_layouts[node.args[0]][node.args[1]]
+            layouts[node] = node.meta["dims"] = dims
+            converted.add(node)
+            continue
+
+        supported = (
+            target in copies + squeezes + splits + data_only
+            or target in (aten.select.int, aten.unsqueeze.default, aten.stack.default,
+                          aten.cat.default, aten.slice.Tensor, aten.unbind.int)
+            or is_reshape_op(node)
+            or is_elementwise_op(node) and target != aten.nonzero.default
+            or target == aten.pad.default and get_arg_value(node, 2, "mode", "constant") == "constant"
+        )
+        if not supported or getattr(getattr(target, "_schema", None), "is_mutable", False):
+            continue
+        # If every tuple element is already required in its original order,
+        # restore the input once instead of adding a conversion per output.
+        if isinstance(getattr(node, "value", None), (tuple, list)):
+            exposed = set()
+            for user in node.users:
+                if user.op == "output":
+                    exposed.update(range(len(node.value)))
+                elif user.target == operator.getitem and isinstance(user.args[1], int):
+                    if any(consumer.op == "output" for consumer in user.users):
+                        exposed.add(user.args[1] % len(node.value))
+            if len(exposed) == len(node.value):
+                continue
+        if target in data_only + quantization:
+            # Only data, scale, and zero point share activation axes. Lookup
+            # tables and convolution parameters keep their own interpretation.
+            count = 3 if target in quantization else 1
+            inputs = [
+                get_arg_value(node, index, argument.name)
+                for index, argument in enumerate(target._schema.arguments[:count])
+            ]
+            inputs = [n for n in inputs if isinstance(n, Node)]
+        else:
+            inputs = list(node.all_input_nodes)
+        if node not in seeds and not any(n in layouts for n in inputs):
+            continue
+        # An input already returned in its original layout can also serve this
+        # branch. Keep propagation where a later convolution or model permute
+        # can still benefit; otherwise reuse that one required restoration.
+        if node not in seeds and node not in layout_required and any(
+            n in layouts and any(user.op == "output" for user in n.users)
+            for n in inputs
+        ):
+            continue
+
+        # Broadcasting aligns logical axes on the right before any permutation.
+        # Choose a full-size activation's layout before a scalar or scale input.
+        rank = len(inputs[0].shape)
+        if is_elementwise_op(node) and target not in quantization + (quantized.vmap.default,):
+            rank = len(node.shape)
+        active = [n for n in inputs if n in layouts and len(n.shape) <= rank]
+        if target == aten.conv1d.default:
+            dims = NCL_TO_NLC
+        elif active:
+            source = max(active, key=lambda n: len(n.shape))
+            leading = rank - len(source.shape)
+            dims = tuple(range(leading)) + tuple(d + leading for d in layouts[source])
+        else:
+            dims = NCL_TO_NLC if rank == 3 else tuple(range(rank))
+
+        # At a multi-input model output, compare moving the inputs with moving
+        # the result. This avoids converting an external operand only to convert
+        # the combined result back. Size-one axes move no elements.
+        if len(inputs) > 1 and all(user.op == "output" for user in node.users):
+            costs = {}
+            for candidate in (dims, tuple(range(rank))):
+                cost = 0
+                for operand in inputs:
+                    leading = rank - len(operand.shape)
+                    shape = (1,) * leading + tuple(operand.shape)
+                    current = layouts.get(operand, tuple(range(len(operand.shape))))
+                    current = tuple(range(leading)) + tuple(d + leading for d in current)
+                    if [d for d in current if shape[d] > 1] != [d for d in candidate if shape[d] > 1]:
+                        cost += operand.value.numel() * operand.value.element_size()
+                output_dims = list(candidate)
+                if target == aten.stack.default:
+                    axis = get_arg_value(node, 1, "dim", 0) % (rank + 1)
+                    output_dims = [d + (d >= axis) for d in candidate]
+                    output_dims.insert(axis, axis)
+                if [d for d in output_dims if node.shape[d] > 1] != [d for d in range(len(node.shape)) if node.shape[d] > 1]:
+                    cost += node.value.numel() * node.value.element_size()
+                costs[candidate] = cost
+            dims = min(costs, key=costs.get)
+
+        for operand in inputs:
+            if not len(operand.shape):
+                continue
+            original_dims = layouts.get(operand, tuple(range(len(operand.shape))))
+            leading = rank - len(original_dims)
+            aligned_dims = tuple(range(leading)) + tuple(d + leading for d in original_dims)
+            permutation = tuple(aligned_dims.index(d) for d in dims)
+            if permutation == tuple(range(rank)):
+                continue
+            with graph.inserting_before(node):
+                aligned = operand
+                if leading:
+                    shape = (1,) * leading + tuple(operand.shape[d] for d in original_dims)
+                    aligned = graph.call_function(aten.reshape.default, (operand, shape))
+                    converted.add(aligned)
+                permuted = graph.call_function(aten.permute.default, (aligned, permutation))
+            permuted.meta["dtype"] = operand.meta.get("dtype")
+            converted.add(permuted)
+            node.replace_input_with(operand, permuted)
+
+        result_dims = dims
+        if target in (aten.transpose.int, aten.permute.default):
+            if target == aten.transpose.int:
+                permutation = list(range(rank))
+                if rank:
+                    first = get_arg_value(node, 1, "dim0") % rank
+                    second = get_arg_value(node, 2, "dim1") % rank
+                    permutation[first], permutation[second] = permutation[second], permutation[first]
+            else:
+                permutation = [d % rank for d in get_arg_value(node, 1, "dims")]
+            result_dims = tuple(permutation.index(d) for d in dims)
+            operand = get_arg_value(node, 0, target._schema.arguments[0].name)
+            node.target, node.args, node.kwargs = aten.alias.default, (operand,), {}
+            aliases.append(node)
+        elif target in (aten.unsqueeze.default, aten.stack.default):
+            axis = get_arg_value(node, 1, "dim", 0) % (rank + 1)
+            result_dims = [d + (d >= axis) for d in dims]
+            result_dims.insert(axis, axis)
+            result_dims = tuple(result_dims)
+        elif target in squeezes + (aten.select.int, aten.unbind.int):
+            if not rank:
+                # Squeezing a scalar keeps it scalar, including dim=0 or -1.
+                removed = []
+            elif target == aten.squeeze.default:
+                removed = [d for d, size in enumerate(inputs[0].shape) if size == 1]
+            else:
+                axis = get_arg_value(node, 1, "dim", 0)
+                axes = axis if target == aten.squeeze.dims else [axis]
+                axes = [d % rank for d in axes]
+                removed = [d for d in axes if target not in squeezes or inputs[0].shape[d] == 1]
+                mapped = [dims.index(d) for d in axes]
+                mapped = mapped if target == aten.squeeze.dims else mapped[0]
+                if len(node.args) > 1:
+                    node.update_arg(1, mapped)
+                else:
+                    node.update_kwarg("dim", mapped)
+            result_dims = tuple(d - sum(r < d for r in removed) for d in dims if d not in removed)
+        elif target in splits:
+            axis = get_arg_value(node, 2, "dim", 0) % rank
+            if len(node.args) > 2:
+                node.update_arg(2, dims.index(axis))
+            else:
+                node.update_kwarg("dim", dims.index(axis))
+        else:
+            _rewrite_node_args_for_layout(node, dims)
+
+        converted.add(node)
+        if isinstance(node.value, (tuple, list)):
+            output_layouts[node] = tuple(result_dims for _ in node.value)
+            node.meta["output_dims"] = output_layouts[node]
+        else:
+            layouts[node] = node.meta["dims"] = result_dims
+
+    # Restore only edges leaving the converted graph. A tuple must be unpacked
+    # first; its data and scales can have different shapes and logical dtypes.
+    node_order = {node: index for index, node in enumerate(graph.nodes)}
+    for node in nodes:
+        if node not in layouts and node not in output_layouts:
+            continue
+        replacement = None
+        for user in list(node.users):
+            if user in converted:
+                continue
+            if replacement is not None:
+                user.args = torch.fx.map_arg(user.args, lambda n: replacement if n is node else n)
+                user.kwargs = torch.fx.map_arg(user.kwargs, lambda n: replacement if n is node else n)
+                continue
+            # One restored value can serve every original-layout consumer. Put
+            # it before the first consumer in graph order to preserve dominance.
+            first_user = min((n for n in node.users if n not in converted), key=node_order.get)
+            with graph.inserting_before(first_user):
+                restored = []
+                permutations = output_layouts[node] if node in output_layouts else (layouts[node],)
+                for index, dims in enumerate(permutations):
+                    value = node
+                    dtype = node.meta.get("dtype")
+                    if node in output_layouts:
+                        value = graph.call_function(operator.getitem, (node, index))
+                        converted.add(value)
+                        dtype = dtype[index] if isinstance(dtype, (tuple, list)) else None
+                        value.meta["dtype"] = dtype
+                    if dims != tuple(range(len(dims))):
+                        inverse = tuple(dims.index(d) for d in range(len(dims)))
+                        value = graph.call_function(aten.permute.default, (value, inverse))
+                        converted.add(value)
+                        value.meta["dtype"] = dtype
+                    value.shape = node.shape[index] if node in output_layouts else node.shape
+                    restored.append(value)
+            replacement = restored[0]
+            if node in output_layouts:
+                # ShapeProp stores lists as tuples; preserve the operator's
+                # actual return type when a consumer receives the whole result.
+                returns = node.target._schema.returns
+                replacement = restored if len(returns) == 1 and isinstance(returns[0].type, torch.ListType) else tuple(restored)
+            user.args = torch.fx.map_arg(user.args, lambda n: replacement if n is node else n)
+            user.kwargs = torch.fx.map_arg(user.kwargs, lambda n: replacement if n is node else n)
+
+    for node in reversed(aliases):
+        node.replace_all_uses_with(node.args[0])
+        graph.erase_node(node)
+        converted.remove(node)
+    # These maps describe the Conv1D rewrite, not the NHWC conversion that a
+    # later Conv2D may request. Boundary shapes are back in the original order.
+    for node in converted:
+        node.meta.pop("dims", None)
+    return converted
+
+
+def transpose_conv2d_inputs_and_weights(model: GraphModule):
+    """Convert convolution islands to channel-last layout during compilation.
+
+    Preserve the existing NHWC/HWIO Conv2D path and use NLC activations with
+    unchanged weights for Conv1D. Conv1D tracks rank changes and tuple outputs
+    separately; Conv2D retains its existing four-dimensional groups. The following
+    reshape-elimination pass removes conversions that cancel existing ones.
+    """
+    graph = model.graph
+    visited_nodes = transpose_conv1d_activations(model)
 
     torch.nn.functional.conv2d = conv2d_transposed
 
@@ -273,12 +598,12 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
         if node in visited_nodes or node.target not in TRANSPOSED_OPERATORS:
             continue
 
-        # Extract the cluster of nodes that can share the NHWC layout
+        # Extract the cluster of nodes that can share channel-last activations.
         island_nodes = extract_conv2d_graph(model, node, visited_nodes)
         island_set = set(island_nodes)
 
         for node_to_treat in island_nodes:
-            # Inspect inputs to see if they come from outside the island (NCHW)
+            # Convert incoming activation edges from their original layout.
             for input_node in list(node_to_treat.all_input_nodes):
                 if input_node in island_set or "dims" in input_node.meta:
                     continue
@@ -289,7 +614,7 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
                 if user in island_set or "dims" in user.meta:
                     continue
 
-                logger.debug(f"Insert permute before {user} with dims (0, 3, 1, 2)")
+                logger.debug(f"Insert permute before {user} with dims {NHWC_TO_NCHW}")
                 with graph.inserting_before(user):
                     permute_node = graph.call_function(
                         torch.ops.aten.permute.default,
@@ -334,6 +659,12 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
 
 
 def eliminate_reshape_with_no_effect(model: GraphModule):
+    """Replace cancelling layout chains with a reshape after shape propagation.
+
+    Preserve conversions that change dtype even when indexed element order is
+    unchanged; removing such a cast would alter subsequent numerical operations.
+    The compiler invokes this after its convolution and linear layout passes.
+    """
     deleted_nodes = set()
     for node in list(model.graph.nodes):
         if not is_reshape_op(node) or node in deleted_nodes:
@@ -346,6 +677,8 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
         while (
             len(curr_node.users) == 1
             and (is_reshape_op(curr_node) or is_nop(curr_node))
+            # A cast can preserve indexed element order while changing values.
+            and curr_node.value.dtype == curr_node.args[0].value.dtype
         ):
             group.append(curr_node)
             curr_node = next(iter(curr_node.users))
@@ -366,7 +699,7 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
 
         del group[last_valid_idx + 1:]
 
-        if len(group) <= 1:
+        if not group:
             continue
 
         logger.debug(f"Eliminating reshape group: {[n.name for n in group]}")

@@ -17,6 +17,34 @@ quantized_decomposed_lib = Library("quantized_ops", "DEF")
 
 
 quantized_decomposed_lib.define(
+    "conv1d(Tensor input, Tensor weight, Tensor? bias=None, SymInt[1] stride=1, "
+    "SymInt[1] padding=0, SymInt[1] dilation=1, SymInt groups=1) -> Tensor"
+)
+
+
+@impl(quantized_decomposed_lib, "conv1d", "CompositeExplicitAutograd")
+def conv1d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: Union[int, Tuple[int]] = 1,
+    padding: Union[int, Tuple[int]] = 0,
+    dilation: Union[int, Tuple[int]] = 1,
+    groups: int = 1,
+) -> torch.Tensor:
+    """Execute the layout pass's Conv1D with channel-last input and output.
+
+    Graph execution and fake shape propagation use this operator after layout
+    conversion. Activations are NLC; weights retain PyTorch's [O, I/groups, K]
+    layout, including depthwise weights. ATen supplies the reference calculation;
+    the compiler emits one Conv1D operator with no activation transpose nodes.
+    """
+    return F.conv1d(
+        input.permute(0, 2, 1), weight, bias, stride, padding, dilation, groups
+    ).permute(0, 2, 1)
+
+
+quantized_decomposed_lib.define(
     "conv2d(Tensor input, Tensor weight, Tensor? bias=None, SymInt[2] stride=1, "
     "SymInt[2] padding=0, SymInt[2] dilation=1, SymInt groups=1) -> Tensor"
 )
