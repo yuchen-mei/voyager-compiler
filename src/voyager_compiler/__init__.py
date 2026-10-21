@@ -135,6 +135,7 @@ def transform(
     split_spmm=False,
     use_fake_mode=True,
     pad_terminal_output=True,
+    materialize_broadcasts=True,
 ):
     """Lower a calibrated graph while retaining real sparse capacity analysis.
 
@@ -142,6 +143,9 @@ def transform(
     Dense activation shapes use fake tensors; parameters and codebooks remain
     real. Legacy sparse tiling reads CSR contents, so sparse graphs keep their
     existing real propagation even when ``use_fake_mode`` is requested.
+    ``materialize_broadcasts`` rewrites expand into stacked memory copies and
+    normalizes cat/stack for small graphs; a backend that reads a broadcast
+    directly from its source passes False to keep expand as a view.
     """
     if example_kwargs is None:
         example_kwargs = {}
@@ -172,7 +176,7 @@ def transform(
 
     # TODO Disabled for large models. This will be removed in the future once
     # we can handle stack/cat using DMA properly.
-    if len(model.graph.nodes) < 10000:
+    if materialize_broadcasts and len(model.graph.nodes) < 10000:
         convert_expand_to_memory_copy(model)
         convert_cat_and_stack_as_stack_on_dim0(model)
         convert_cat_with_mismatched_shapes_to_stack(model)
