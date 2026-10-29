@@ -291,6 +291,68 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
     return output_nodes[0]
 
 
+def _sink_broadcast_elementwise_into_bmm(model: GraphModule, output: Node):
+    """Apply a mul/add that follows a decomposed batched matmul to each per-batch result.
+
+    ``output`` is the view of the stacked per-batch matmul results. When its only
+    user is an elementwise mul or add whose other operand is the same for every
+    batch element (its batch dims are size one, possibly behind an expand), the
+    op is moved in front of the stack and applied to each matmul result, so it
+    can fuse into that matmul's output tail instead of running as a separate
+    pass over the stacked tensor. The Mamba SSD scores B @ C^T times the causal
+    keep mask is such a case: the mask is one [L, L] tensor shared by every
+    state group.
+    """
+    graph = model.graph
+    users = list(output.users)
+    if len(users) != 1:
+        return
+    user = users[0]
+    if user.target not in (torch.ops.aten.mul.Tensor, torch.ops.aten.add.Tensor):
+        return
+    if len(user.args) != 2 or user.args.count(output) != 1:
+        return
+    other = user.args[1] if user.args[0] is output else user.args[0]
+    if not isinstance(other, Node):
+        return
+    source = other
+    if source.target == torch.ops.aten.expand.default:
+        source = source.args[0]
+    if (
+        len(source.shape) < 2
+        or any(d != 1 for d in source.shape[:-2])
+        or list(source.shape[-2:]) != list(output.shape[-2:])
+    ):
+        return
+    stack = output.args[0]
+    if stack.target != torch.ops.aten.stack.default or len(stack.users) != 1:
+        return
+    matmuls = list(stack.args[0])
+
+    # The other operand may be defined after the stack (it was created next to
+    # the elementwise op), so build the per-batch ops right before that op and
+    # move the stack and its view behind them.
+    with graph.inserting_before(user):
+        operand = source
+        while len(operand.shape) > 2:
+            operand = graph.call_function(torch.ops.aten.select.int, (operand, 0, 0))
+            propagate_shape(operand)
+        results = []
+        for matmul in matmuls:
+            args = (matmul, operand) if user.args[0] is output else (operand, matmul)
+            result = graph.call_function(user.target, args, dict(user.kwargs))
+            propagate_shape(result)
+            result.meta["dtype"] = user.meta.get("dtype")
+            results.append(result)
+    stack.args = (results,) + tuple(stack.args[1:])
+    results[-1].append(stack)
+    stack.append(output)
+    user.replace_all_uses_with(output)
+    graph.erase_node(user)
+    propagate_shape(stack)
+    propagate_shape(output)
+
+
 def _decompose_bmm_helper(model: GraphModule, node: Node):
     if node.target == torch.ops.aten.matmul.default:
         return _decompose_bmm(model, node)
@@ -318,7 +380,9 @@ def split_multi_head_attention(model: GraphModule):
     for nodes in grouped_nodes.values():
         if len(nodes) != 2:
             for node in nodes:
-                _decompose_bmm_helper(model, node)
+                output = _decompose_bmm_helper(model, node)
+                if output is not None:
+                    _sink_broadcast_elementwise_into_bmm(model, output)
             continue
 
         qk_matmul, pv_matmul = nodes[0], nodes[1]
@@ -348,6 +412,9 @@ def split_multi_head_attention(model: GraphModule):
                 f"Failed to find paths between {qk_matmul} and {pv_matmul}. "
                 "Skipping fusion."
             )
+            for output in (qk_output, pv_output):
+                if output is not None:
+                    _sink_broadcast_elementwise_into_bmm(model, output)
             continue
 
         nodes_between = set()
