@@ -52,7 +52,33 @@ def _broadcast_batch_index(tensor: torch.Tensor, idx: tuple) -> tuple:
     return tuple(0 if dim == 1 else i for i, dim in zip(idx[offset:], batch))
 
 
-def _decompose_bmm(model: GraphModule, node: Node):
+def _row_merged_batch_axes(input_shape, other_shape) -> int:
+    """Return how many trailing batch axes of a matmul fold into the rows of input.
+
+    A trailing batch axis folds when other has size one along it and input has
+    the full broadcast size: every batch element along that axis multiplies the
+    same other matrix, so the input matrices stacked along it form one taller
+    input matrix. Counting stops at the first axis that does not fold.
+    """
+    batch = torch.broadcast_shapes(input_shape[:-2], other_shape[:-2])
+    input_batch = tuple(input_shape[:-2])
+    other_batch = (1,) * (len(batch) - len(other_shape[:-2])) + tuple(other_shape[:-2])
+    merged = 0
+    for axis in range(1, min(len(batch), len(input_batch)) + 1):
+        if other_batch[-axis] != 1 or input_batch[-axis] != batch[-axis]:
+            break
+        merged += 1
+    return merged
+
+
+def _outer_batch_index(tensor: torch.Tensor, idx: tuple, merged: int) -> tuple:
+    """Index tensor's batch axes at outer batch index idx, keeping its last merged batch axes whole."""
+    lead = tensor.shape[: tensor.ndim - 2 - merged]
+    offset = len(idx) - len(lead)
+    return tuple(0 if dim == 1 else i for i, dim in zip(idx[offset:], lead))
+
+
+def _decompose_bmm(model: GraphModule, node: Node, merge_rows: bool = False):
     input1 = node.args[0].value
     input2 = node.args[1].value
 
@@ -60,19 +86,25 @@ def _decompose_bmm(model: GraphModule, node: Node):
     input2_dims = sum(1 for d in input2.shape if d > 1)
     if input1_dims < 3 and input2_dims < 3:
         return None
+    merged = _row_merged_batch_axes(input1.shape, input2.shape) if merge_rows else 0
 
     class BMM(torch.nn.Module):
         def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            # Loop through each element in the (broadcast) batch dimensions
+            # Loop through each element in the (broadcast) batch dimensions.
+            # The last ``merged`` batch axes, where y is shared, stay in each
+            # matmul as extra rows of x.
             batch_shape = torch.broadcast_shapes(x.shape[:-2], y.shape[:-2])
+            outer = batch_shape[: len(batch_shape) - merged]
             result = []
-            for idx in itertools.product(*[range(dim) for dim in batch_shape]):
+            for idx in itertools.product(*[range(dim) for dim in outer]):
+                rows = x[_outer_batch_index(x, idx, merged)]
+                if merged:
+                    rows = rows.reshape(-1, rows.shape[-1])
                 result.append(torch.matmul(
-                    x[_broadcast_batch_index(x, idx)],
-                    y[_broadcast_batch_index(y, idx)],
+                    rows, y[_broadcast_batch_index(y, idx + (0,) * merged)],
                 ))
             result = torch.stack(result)
-            result = result.view(*batch_shape, *result.shape[-2:])
+            result = result.view(*batch_shape, x.shape[-2], result.shape[-1])
             return result
 
     gm = export_model(BMM(), (input1, input2))
@@ -85,7 +117,15 @@ def _decompose_bmm(model: GraphModule, node: Node):
         if n.target == torch.ops.aten.select.int:
             n.meta["dtype"] = n.args[0].meta.get("dtype")
 
-        if n.target in [
+        # A view of an operand slice (rows merged from shared-operand batch
+        # axes) keeps the operand's dtype; the view of the stacked results
+        # takes the matmul's.
+        if (
+            n.target in (torch.ops.aten.view.default, torch.ops.aten.reshape.default)
+            and n.args[0].target != torch.ops.aten.stack.default
+        ):
+            n.meta["dtype"] = n.args[0].meta.get("dtype")
+        elif n.target in [
             node.target,
             torch.ops.aten.stack.default,
             torch.ops.aten.view.default
@@ -95,7 +135,7 @@ def _decompose_bmm(model: GraphModule, node: Node):
     return output_nodes[0]
 
 
-def _decompose_bmm_mx(model: GraphModule, node: Node):
+def _decompose_bmm_mx(model: GraphModule, node: Node, merge_rows: bool = False):
     input1 = node.args[0].value
     input2 = node.args[1].value
 
@@ -105,6 +145,11 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
         return None
 
     block_size = node.kwargs['block_size']
+    merged = (
+        _row_merged_batch_axes(input1.shape, input2.shape)
+        if merge_rows and node.kwargs.get('A_data', None) is None
+        else 0
+    )
 
     class BMM(torch.nn.Module):
         def forward(
@@ -115,13 +160,19 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
             # A size-one batch axis of either operand (for example a key/value
             # head shared by several query heads) is read at index 0 for every
             # output batch element, so no expanded copy of that operand exists.
+            # The last ``merged`` batch axes, where other is shared, stay in
+            # each matmul as extra rows of input.
             batch_shape = torch.broadcast_shapes(input.shape[:-2], other.shape[:-2])
+            outer = batch_shape[: len(batch_shape) - merged]
             result = []
-            for idx in itertools.product(*[range(dim) for dim in batch_shape]):
-                input_idx = _broadcast_batch_index(input, idx)
-                other_idx = _broadcast_batch_index(other, idx)
+            for idx in itertools.product(*[range(dim) for dim in outer]):
+                input_idx = _outer_batch_index(input, idx, merged)
+                other_idx = _broadcast_batch_index(other, idx + (0,) * merged)
+                rows_scale = input_scale[input_idx]
+                if merged:
+                    rows_scale = rows_scale.reshape(-1, rows_scale.shape[-1])
                 kwargs = {
-                    "input_scale": input_scale[input_idx],
+                    "input_scale": rows_scale,
                     "weight_scale": weight_scale[other_idx],
                     "block_size": block_size,
                     "input_code": input_code,
@@ -134,11 +185,14 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
                         "A_indptr": A_indptr[idx],
                         "weight_transposed": weight_transposed,
                     })
+                rows = input[input_idx]
+                if merged:
+                    rows = rows.reshape(-1, rows.shape[-1])
                 result.append(torch.ops.quantized_ops.matmul_mx(
-                    input[input_idx], other[other_idx], **kwargs,
+                    rows, other[other_idx], **kwargs,
                 ))
             result = torch.stack(result)
-            result = result.view(*batch_shape, *result.shape[-2:])
+            result = result.view(*batch_shape, input.shape[-2], result.shape[-1])
             return result
 
     input_code = node.kwargs.get('input_code', None)
@@ -174,7 +228,15 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
         if n.target == torch.ops.aten.select.int:
             n.meta["dtype"] = n.args[0].meta.get("dtype")
 
-        if n.target in [
+        # A view of an operand slice (rows merged from shared-operand batch
+        # axes) keeps the operand's dtype; the view of the stacked results
+        # takes the matmul's.
+        if (
+            n.target in (torch.ops.aten.view.default, torch.ops.aten.reshape.default)
+            and n.args[0].target != torch.ops.aten.stack.default
+        ):
+            n.meta["dtype"] = n.args[0].meta.get("dtype")
+        elif n.target in [
             node.target,
             torch.ops.aten.stack.default,
             torch.ops.aten.view.default
@@ -328,6 +390,8 @@ def _sink_broadcast_elementwise_into_bmm(model: GraphModule, output: Node):
     if stack.target != torch.ops.aten.stack.default or len(stack.users) != 1:
         return
     matmuls = list(stack.args[0])
+    if any(list(m.shape) != list(output.shape[-2:]) for m in matmuls):
+        return
 
     # The other operand may be defined after the stack (it was created next to
     # the elementwise op), so build the per-batch ops right before that op and
@@ -353,11 +417,17 @@ def _sink_broadcast_elementwise_into_bmm(model: GraphModule, output: Node):
     propagate_shape(output)
 
 
-def _decompose_bmm_helper(model: GraphModule, node: Node):
+def _decompose_bmm_helper(model: GraphModule, node: Node, merge_rows: bool = False):
+    """Split a batched matmul into one matmul per batch element.
+
+    With merge_rows, trailing batch axes along which the second operand is
+    shared become extra rows of each matmul's first operand instead of
+    separate matmuls.
+    """
     if node.target == torch.ops.aten.matmul.default:
-        return _decompose_bmm(model, node)
+        return _decompose_bmm(model, node, merge_rows)
     elif node.kwargs.get('A_data', None) is None:
-        return _decompose_bmm_mx(model, node)
+        return _decompose_bmm_mx(model, node, merge_rows)
     else:
         return _decompose_bmm_mx_with_outlier_inputs(model, node)
 
@@ -380,7 +450,7 @@ def split_multi_head_attention(model: GraphModule):
     for nodes in grouped_nodes.values():
         if len(nodes) != 2:
             for node in nodes:
-                output = _decompose_bmm_helper(model, node)
+                output = _decompose_bmm_helper(model, node, merge_rows=True)
                 if output is not None:
                     _sink_broadcast_elementwise_into_bmm(model, output)
             continue
