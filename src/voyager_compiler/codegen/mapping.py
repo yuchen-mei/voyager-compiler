@@ -19,6 +19,7 @@ from .banking import (
     require_allocation,
 )
 from .mapping_utils import (
+    is_addressing_op,
     is_bmm,
     is_conv2d,
     is_elementwise_op,
@@ -243,7 +244,12 @@ def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]) -> bool:
                 if id(arg) == id(prev_node):
                     continue
 
-                while is_nop(arg):
+                # Look through views and through selects that only offset the
+                # address (memory placement handles them): the operand is ready
+                # when the tensor they read is.
+                while is_nop(arg) or (
+                    arg.target == torch.ops.aten.select.int and is_addressing_op(arg)
+                ):
                     arg = arg.all_input_nodes[0]
 
                 if arg.op == "call_function" and order[arg] > order[prev_node]:
