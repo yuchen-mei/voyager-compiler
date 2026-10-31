@@ -34,6 +34,7 @@ __all__ = [
     "run_matrix_op_l2_tiling",
     "run_vector_op_l2_tiling",
     "split_multi_head_attention",
+    "share_mx_quantization_with_slices",
     "remove_softmax_dtype_cast",
     "transpose_conv2d_inputs_and_weights",
     "transpose_linear_weights",

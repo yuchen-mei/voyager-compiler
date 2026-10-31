@@ -37,6 +37,7 @@ __all__ = [
     "inline_autocast_modules",
     "remove_softmax_dtype_cast",
     "split_multi_head_attention",
+    "share_mx_quantization_with_slices",
 ]
 
 
@@ -430,6 +431,164 @@ def _decompose_bmm_helper(model: GraphModule, node: Node, merge_rows: bool = Fal
         return _decompose_bmm_mx(model, node, merge_rows)
     else:
         return _decompose_bmm_mx_with_outlier_inputs(model, node)
+
+
+_LEADING_VIEW_OPS = (
+    torch.ops.aten.select.int,
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.unsqueeze.default,
+)
+
+
+def _leading_view_chain(node: Node, kept_dims: int):
+    """Follow selects, slices and unsqueezes of ``node`` back to the tensor they view.
+
+    Returns (source, views ordered from the source) when every view indexes or
+    inserts a dim before the last ``kept_dims`` dims, else None. A view that
+    leaves those dims alone keeps the blocks of a quantization over them whole.
+    """
+    views = []
+    while (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target in _LEADING_VIEW_OPS
+    ):
+        source = node.args[0]
+        rank = source.value.ndim
+        if node.target == torch.ops.aten.unsqueeze.default:
+            rank += 1
+        dim = node.args[1] % rank
+        if dim >= rank - kept_dims:
+            return None
+        views.append(node)
+        node = source
+    return node, views[::-1]
+
+
+def share_mx_quantization_with_slices(model: GraphModule):
+    """Reuse the MX quantization of a tensor for its slices.
+
+    A tensor X is sometimes quantized whole for one matmul and again slice by
+    slice for others (the Mamba SSD C^T for the chunk scores, then each chunk
+    of it for that chunk's state contribution). When a slice is taken along
+    dims before the block axes, its block scales and codes equal the same slice
+    of X's scales and codes. Such a slice's calculate_mx_qparam and quantize
+    are replaced by that view chain applied to X's results, so X is quantized
+    once. Quantizations of X that come after the slice's are left alone.
+    """
+    graph = model.graph
+    order = {node: i for i, node in enumerate(graph.nodes)}
+    qparam_op = torch.ops.quantized_ops.calculate_mx_qparam.default
+    quantize_op = torch.ops.quantized_ops.quantize.default
+
+    def qparam_key(node):
+        return (node.args[0], tuple(node.args[1:]), tuple(sorted(node.kwargs.items())))
+
+    def same_arg(a, b):
+        # Each quantize reads its own get_attr copy of the code table (qmap),
+        # which maps every bf16 bit pattern, NaN entries included.
+        if isinstance(a, Node) and isinstance(b, Node):
+            if a is b:
+                return True
+            if a.op != "get_attr" or b.op != "get_attr":
+                return False
+            ta, tb = fetch_attr(model, a.target), fetch_attr(model, b.target)
+            return (
+                ta.shape == tb.shape
+                and ta.dtype == tb.dtype
+                and torch.allclose(
+                    ta.float(), tb.float(), rtol=0, atol=0, equal_nan=True
+                )
+            )
+        return a == b
+
+    def same_quantize(slice_node, whole_node):
+        return (
+            len(slice_node.args) == len(whole_node.args)
+            and all(
+                same_arg(a, b) for a, b in zip(slice_node.args[2:], whole_node.args[2:])
+            )
+            and slice_node.kwargs.keys() == whole_node.kwargs.keys()
+            and all(
+                same_arg(slice_node.kwargs[k], whole_node.kwargs[k])
+                for k in slice_node.kwargs
+            )
+        )
+
+    qparams = {}
+    quantizes = defaultdict(list)
+    for node in graph.nodes:
+        if node.target == qparam_op:
+            qparams.setdefault(qparam_key(node), node)
+        elif node.target == quantize_op:
+            quantizes[(node.args[0], node.args[1])].append(node)
+
+    def replay(views, source, like):
+        result = source
+        with graph.inserting_before(like):
+            for view in views:
+                result = graph.call_function(
+                    view.target, (result, *view.args[1:]), view.kwargs
+                )
+                propagate_shape(result)
+                result.meta["dtype"] = like.meta.get("dtype")
+        return result
+
+    for slice_qparam in [n for n in graph.nodes if n.target == qparam_op]:
+        axes = slice_qparam.args[1]
+        ndim = slice_qparam.args[0].value.ndim
+        kept_dims = max(ndim - (a % ndim) for a in axes)
+        found = _leading_view_chain(slice_qparam.args[0], kept_dims)
+        if found is None or not found[1]:
+            continue
+        source, views = found
+        key = qparam_key(slice_qparam)
+        whole_qparam = qparams.get((source, *key[1:]))
+        if whole_qparam is None or order[whole_qparam] > order[slice_qparam]:
+            continue
+        # Quantizes of the slice need a matching quantize of the whole tensor;
+        # other readers of the scales (the matmul) take the sliced scales.
+        slice_quantizes = [
+            user for user in slice_qparam.users if user.target == quantize_op
+        ]
+        view_steps = [(view.target, tuple(view.args[1:])) for view in views]
+        whole_quantizes = []
+        dead_views = list(views)
+        for user in slice_quantizes:
+            whole = None
+            # The quantize may read its own copy of the same views.
+            user_found = _leading_view_chain(user.args[0], kept_dims)
+            if (
+                user_found is not None
+                and user_found[0] is source
+                and [(v.target, tuple(v.args[1:])) for v in user_found[1]]
+                == view_steps
+            ):
+                whole = next(
+                    (
+                        q
+                        for q in quantizes[(source, whole_qparam)]
+                        if same_quantize(user, q)
+                    ),
+                    None,
+                )
+                dead_views.extend(user_found[1])
+            if whole is None or order[whole] > order[user]:
+                break
+            whole_quantizes.append(whole)
+        else:
+            for user, whole in zip(slice_quantizes, whole_quantizes):
+                user.replace_all_uses_with(replay(views, whole, user))
+                graph.erase_node(user)
+            slice_qparam.replace_all_uses_with(
+                replay(views, whole_qparam, slice_qparam)
+            )
+            graph.erase_node(slice_qparam)
+            for view in sorted(set(dead_views), key=order.get, reverse=True):
+                if not view.users:
+                    graph.erase_node(view)
+    graph.lint()
+    model.recompile()
 
 
 def split_multi_head_attention(model: GraphModule):

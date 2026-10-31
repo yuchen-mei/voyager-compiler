@@ -172,6 +172,7 @@ def transform(
     # Break down complex operators (like MultiHeadAttention) into simpler
     # primitives and handle memory copy/concat operations.
 
+    share_mx_quantization_with_slices(model)
     split_multi_head_attention(model)
 
     # TODO Disabled for large models. This will be removed in the future once
