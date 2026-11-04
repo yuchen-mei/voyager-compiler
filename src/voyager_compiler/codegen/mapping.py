@@ -3,12 +3,14 @@ import logging
 import math
 import operator
 import os
+import weakref
 from typing import List, Dict, Callable, Union, Any
 from collections import defaultdict
 
 import graphviz
 import torch
 from torch.fx import Node, Graph, GraphModule
+from torch.fx.graph import _illegal_names, _name_regex
 from torch.fx.node import map_arg
 from torch.fx.operator_schemas import normalize_function
 from transformers.utils.import_utils import is_torch_greater_or_equal
@@ -50,6 +52,52 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
 
+# For each torch.fx graph namespace: base name -> n, where the names
+# base_1 .. base_n are all taken.
+_taken_name_counts = weakref.WeakKeyDictionary()
+
+
+def _node_copy(graph: Graph, node: Node, arg_transform) -> Node:
+    """Return ``graph.node_copy(node, arg_transform)``, with the same new name.
+
+    When a numbered name such as ``select_5`` is already taken, torch.fx tries
+    ``select_1``, ``select_2``, ... and takes the first free one, so each copy
+    rescans every taken number. A graph never releases a name, so this
+    remembers how many leading numbers are taken and starts the scan there.
+    Other names are left for torch.fx to resolve as usual.
+    """
+    namespace = graph._graph_namespace
+    name = node.name
+    match = _name_regex.match(name)
+    numbered = (
+        match is not None
+        and match.group(2) is not None
+        and name in namespace._used_names
+        and name not in _illegal_names
+    )
+    if numbered:
+        base = match.group(1)
+        taken = _taken_name_counts.setdefault(namespace, {})
+        start = namespace._base_count.get(name, 0) + 1
+        count = taken.get(base, 0)
+        num = max(start, count + 1)
+        while f"{base}_{num}" in namespace._used_names:
+            num += 1
+        name = f"{base}_{num}"
+
+    new_node = graph.create_node(
+        node.op,
+        node.target,
+        map_arg(node.args, arg_transform),
+        map_arg(node.kwargs, arg_transform),
+        name,
+        node.type,
+    )
+    new_node.meta = copy.copy(node.meta)
+    if numbered and start <= count + 1:
+        taken[base] = num
+    return new_node
+
 
 def replace_node_with_graph_module(
     gm: GraphModule,
@@ -83,7 +131,9 @@ def replace_node_with_graph_module(
                         gm, gm.graph, "_tensor_constant_", param
                     )
                 else:
-                    value_remap[node] = gm.graph.node_copy(node, lambda n: value_remap[n])
+                    value_remap[node] = _node_copy(
+                        gm.graph, node, lambda n: value_remap[n]
+                    )
                 propagate_shape(value_remap[node], gm)
 
     return [value_remap[n] for n in output]
