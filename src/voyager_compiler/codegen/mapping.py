@@ -382,10 +382,15 @@ def is_mha_qkv_permute(node):
     the permuted dimensions are the middle two dimensions (2 and 3) of a 4D
     tensor.
     """
-    # Don't support head dimension not being a power of 2
+    # Don't support head dimension not being a power of 2. The permuted
+    # address pattern has no batch term, so the batch must be one. A tiler
+    # that finds no tile for the fused head split sets
+    # meta["fuse_mha_permute"] = False to keep the permute a plain transpose.
     if (
+        getattr(node, "meta", {}).get("fuse_mha_permute") is False or
         not hasattr(node, 'shape') or
         len(node.shape) != 4 or
+        node.shape[0] != 1 or
         not math.log2(node.shape[-1]).is_integer()
     ):
         return False
