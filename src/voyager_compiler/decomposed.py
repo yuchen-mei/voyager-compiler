@@ -113,6 +113,49 @@ def linear(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None)
 
 
 quantized_decomposed_lib.define(
+    "bitonic_merge_step(Tensor records, int size, int stride, int[] order) -> Tensor"
+)
+
+
+@impl(quantized_decomposed_lib, "bitonic_merge_step", "CompositeExplicitAutograd")
+def bitonic_merge_step(records: torch.Tensor, size: int, stride: int, order: List[int]) -> torch.Tensor:
+    """One compare-exchange step of a bitonic sorting network over records.
+
+    ``records`` is [n, F]: row i holds the F fields of record i, and n is a
+    multiple of ``size``. Records compare field by field in ``order``: -1 puts
+    the larger value first, 1 the smaller value first, and 0 carries the field
+    without comparing it. With ``stride == size // 2`` the step pairs record j
+    of each block of ``size`` records with record size - 1 - j of the block
+    (the first step of a merge); otherwise it pairs records i and i + stride
+    for the i whose stride bit is 0. A pair is swapped when its second record
+    must come first. After the steps of every merge size from 2 to n, the
+    records are sorted. Only comparisons and selections are used, so the
+    result is exact. Returns the new [n, F] records.
+    """
+    n, fields = records.shape
+    pairs = records.reshape(n // (2 * stride), 2, stride, fields)
+    first, second = pairs[:, 0], pairs[:, 1]
+    mirrored = stride == size // 2
+    if mirrored:
+        second = second.flip(1)
+    swap = torch.zeros_like(first[..., 0], dtype=torch.bool)
+    decided = torch.zeros_like(swap)
+    for field, direction in enumerate(order):
+        if direction == 0:
+            continue
+        a, b = second[..., field], first[..., field]
+        better, worse = (a > b, a < b) if direction < 0 else (a < b, a > b)
+        swap = swap | (~decided & better)
+        decided = decided | better | worse
+    swap = swap[..., None]
+    new_first = torch.where(swap, second, first)
+    new_second = torch.where(swap, first, second)
+    if mirrored:
+        new_second = new_second.flip(1)
+    return torch.stack([new_first, new_second], dim=1).reshape(n, fields)
+
+
+quantized_decomposed_lib.define(
     "matmul(Tensor self, Tensor other) -> Tensor"
 )
 

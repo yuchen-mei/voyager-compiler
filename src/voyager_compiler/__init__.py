@@ -3,6 +3,7 @@ from torch.utils._pytree import tree_flatten
 
 from .codegen import *
 from .decomposed import *
+from .compaction import *
 from .fake_quantize import *
 from .fp8 import *
 from .histogram import *
