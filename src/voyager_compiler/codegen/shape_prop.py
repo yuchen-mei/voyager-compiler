@@ -1,4 +1,5 @@
 import logging
+import operator
 from contextlib import nullcontext
 from typing import Dict, List, Optional
 
@@ -24,19 +25,31 @@ class ShapeProp:
     source tensor's logical dtype instead of shadowing it with a storage dtype.
     """
 
-    def __init__(self, mod, mode: Optional[FakeTensorMode] = None, tensor_files=None):
+    def __init__(
+        self,
+        mod,
+        mode: Optional[FakeTensorMode] = None,
+        tensor_files=None,
+        tensor_regions=None,
+    ):
         """Configure graph propagation or bounded real tensor-file execution.
 
         Compiler passes provide ``mode`` for shape-only execution. Code emission
         instead supplies ``tensor_files`` mapping resolved protobuf names to file
         paths: execute real inputs, save those values synchronously before later
         mutations, and retain only fake node values after each operation.
+        ``tensor_regions`` maps every ``tensor_files`` name to the part to write:
+        None for the whole tensor, or a region list for ``write_tensor_regions``.
+        With it, only the nodes the saved tensors are computed from execute; if
+        any graph op writes a tensor in place, every node up to the last saved
+        one executes instead. Nodes that do not execute keep their values.
         """
         self.mod = mod
         self.graph = mod.graph
         self.modules = dict(self.mod.named_modules())
         self._mode = mode
         self._tensor_files = tensor_files
+        self._tensor_regions = tensor_regions
 
     def propagate(self, *args):
         """Refresh every node from positional inputs and return the graph output.
@@ -74,8 +87,12 @@ class ShapeProp:
         env : Dict[str, Node] = {}
         if self._tensor_files is not None:
             from ..pt2e_utils import FAKE_MODE
-            from .mapping_utils import save_tensor
+            from .mapping_utils import save_tensor, write_tensor_regions
             pending_files = set(self._tensor_files)
+        executed = (
+            self._nodes_for_tensor_files()
+            if self._tensor_regions is not None else None
+        )
 
         def load_arg(a):
             return torch.fx.graph.map_arg(a, lambda n: env[n.name])
@@ -102,6 +119,8 @@ class ShapeProp:
                 user_to_last_uses.setdefault(user, []).append(n)
 
         for node in reversed(self.graph.nodes):
+            if executed is not None and node not in executed:
+                continue
             map_arg(node.args, lambda n: register_last_uses(n, node))
             map_arg(node.kwargs, lambda n: register_last_uses(n, node))
 
@@ -116,6 +135,10 @@ class ShapeProp:
                 env.pop(n.name)
 
         for node in self.graph.nodes:
+            if executed is not None and node not in executed:
+                if node.op == 'placeholder':
+                    next(args_iter)
+                continue
             try:
                 if node.op == 'placeholder':
                     result = next(args_iter)
@@ -153,7 +176,18 @@ class ShapeProp:
                 )
                 for name, value in tensors:
                     if name in pending_files:
-                        save_tensor(value, self._tensor_files[name], synchronous=True)
+                        regions = (
+                            self._tensor_regions.get(name)
+                            if self._tensor_regions is not None else None
+                        )
+                        if regions is None:
+                            save_tensor(
+                                value, self._tensor_files[name], synchronous=True
+                            )
+                        else:
+                            write_tensor_regions(
+                                value, self._tensor_files[name], regions
+                            )
                         pending_files.remove(name)
 
             if isinstance(result, torch.Tensor):
@@ -195,4 +229,64 @@ class ShapeProp:
             raise ValueError(
                 f"[ERROR] Tensor dump nodes were not executed: {sorted(pending_files)}"
             )
-        return load_arg(list(self.graph.nodes)[-1])
+        last = list(self.graph.nodes)[-1]
+        if executed is not None and last not in executed:
+            return None
+        return load_arg(last)
+
+    def _nodes_for_tensor_files(self):
+        """Return the set of nodes to execute for the requested tensor files.
+
+        A file name is a node name, or ``<node>_<i>`` for item i of a tuple
+        result; both readings count when both exist. The set holds those nodes
+        and every node they read, directly or indirectly. If any graph of the
+        module writes a tensor in place, it is every node up to the last
+        requested one in graph order.
+        """
+        nodes = list(self.graph.nodes)
+        by_name = {node.name: node for node in nodes}
+        targets = set()
+        for name in self._tensor_files:
+            base, sep, index = name.rpartition("_")
+            found = [by_name[name]] if name in by_name else []
+            if sep and index.isdigit() and base in by_name:
+                found.append(by_name[base])
+            if not found:
+                raise ValueError(f"[ERROR] Tensor file {name} names no graph node")
+            targets.update(found)
+        if _writes_in_place(self.mod):
+            position = {node: i for i, node in enumerate(nodes)}
+            last = max((position[node] for node in targets), default=-1)
+            print(
+                "[INFO] The graph writes a tensor in place; executing every node "
+                "up to the last dumped tensor",
+                flush=True,
+            )
+            return set(nodes[: last + 1])
+        needed = set()
+        stack = list(targets)
+        while stack:
+            node = stack.pop()
+            if node not in needed:
+                needed.add(node)
+                stack.extend(node.all_input_nodes)
+        return needed
+
+
+def _writes_in_place(module) -> bool:
+    """Return whether any FX graph in ``module`` has an op that writes an input."""
+    for submodule in module.modules():
+        graph = getattr(submodule, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            continue
+        for node in graph.nodes:
+            if node.op == "call_function":
+                schema = getattr(node.target, "_schema", None)
+                if schema is not None and schema.is_mutable:
+                    return True
+                name = getattr(node.target, "_qualified_op_name", "")
+                if name.endswith("_") or node.target is operator.setitem:
+                    return True
+            elif node.op == "call_method" and node.target.endswith("_"):
+                return True
+    return False

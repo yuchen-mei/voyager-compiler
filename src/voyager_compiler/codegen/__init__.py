@@ -17,6 +17,7 @@ __all__ = [
     "eliminate_reshape_with_no_effect",
     "extract_input_preprocessor",
     "fuse_operator",
+    "dump_tensor_regions",
     "gen_code",
     "gen_compute_graph",
     "get_conv_bn_layers",

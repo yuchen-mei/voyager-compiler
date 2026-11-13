@@ -62,9 +62,42 @@ def save_tensor(tensor, filename, *, synchronous=False):
     if _custom_save_function is not None:
         _custom_save_function(tensor.cpu().clone() if synchronous else tensor, filename)
     elif synchronous:
-        tensor.detach().cpu().contiguous().to(torch.float32).numpy().tofile(filename)
+        _write_float32(tensor, filename)
     else:
         _save_tensor(tensor, filename)
+
+
+def _write_float32(tensor, filename, chunk_values=1 << 24):
+    """Write a tensor's values as raw float32, converting chunk_values at a time."""
+    values = tensor.detach().cpu().contiguous().reshape(-1)
+    with open(filename, "wb") as f:
+        for start in range(0, values.numel(), chunk_values):
+            values[start : start + chunk_values].to(torch.float32).numpy().tofile(f)
+
+
+def write_tensor_regions(tensor, filename, regions):
+    """Write only some regions of a tensor into a float32 file of its full size.
+
+    Each region is {"shape": S, "slice": [[start, end], ...]}: the tensor viewed
+    as shape S (same element count), restricted to that slice. The file holds
+    every element at its usual offset; bytes outside the regions are file holes
+    and read back as zeros.
+    """
+    if _custom_save_function is not None:
+        raise ValueError("[ERROR] Region tensor dumps do not support a custom saver")
+    values = tensor.detach().cpu().contiguous()
+    with open(filename, "wb") as f:
+        f.truncate(values.numel() * 4)
+    if values.numel() == 0:
+        return
+    out = np.memmap(filename, dtype=np.float32, mode="r+", shape=(values.numel(),))
+    for region in regions:
+        shape = [int(dim) for dim in region["shape"]]
+        index = tuple(slice(int(start), int(end)) for start, end in region["slice"])
+        part = values.reshape(shape)[index].to(torch.float32).numpy()
+        out.reshape(shape)[index] = part
+    out.flush()
+    del out
 
 
 def _apply_transform(node, key, field, is_output=False):

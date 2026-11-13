@@ -2,6 +2,7 @@ from google.protobuf import text_format
 from torch.utils._pytree import tree_flatten
 
 from .codegen import *
+from .codegen.shape_prop import _writes_in_place
 from .decomposed import *
 from .compaction import *
 from .fake_quantize import *
@@ -269,6 +270,7 @@ def compile(
     dump_tensors=True,
     dump_snapshot=False,
     use_fake_mode=True,
+    dump_regions=None,
 ):
     """Emit the legacy protobuf using shape-only dense memory planning.
 
@@ -276,6 +278,14 @@ def compile(
     real CSR capacity analysis; dense graphs propagate fake activations through
     allocation. Code emission materializes requested tensor files in a bounded
     real execution. Allocator history is retained only for ``dump_snapshot``.
+    ``dump_regions`` is None or a function of no arguments that returns tensor
+    regions (see ``dump_tensor_regions``). With it, ``gen_code`` writes only
+    the parameter tensors, the function is called once model.txt and
+    layers.txt are written, and the regions it returns are then written in
+    this process. Raises before code emission if ``dump_regions`` is set and a
+    graph op writes a tensor in place: the parameter dump would run those
+    writes, so the inputs and parameters would no longer hold their original
+    values for the region dump.
     Return the emitted Model protobuf and write the existing output artifacts.
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -316,10 +326,16 @@ def compile(
     if dump_snapshot:
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))
 
+    if dump_regions is not None and _writes_in_place(model):
+        raise ValueError(
+            "[ERROR] The graph writes a tensor in place, so its tensor regions "
+            "cannot be dumped after the parameters; dump every tensor instead"
+        )
     path = os.path.join(output_dir, "tensor_files")
-    params = gen_code(
+    params, tensor_files = gen_code(
         model, flatten_args, path if dump_tensors else None,
         use_fake_mode=use_fake_mode,
+        dump_parameters_only=dump_regions is not None,
     )
 
     with open(os.path.join(output_dir, 'model.txt'), "w") as f:
@@ -335,5 +351,8 @@ def compile(
 
     if len(model.graph.nodes) < 10000:
         gen_compute_graph(model, os.path.join(output_dir, output_file))
+
+    if dump_regions is not None and tensor_files is not None:
+        dump_tensor_regions(model, flatten_args, path, tensor_files, dump_regions())
 
     return params

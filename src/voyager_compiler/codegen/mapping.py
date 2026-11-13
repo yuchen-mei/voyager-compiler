@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import math
 import operator
@@ -1473,7 +1474,13 @@ def run_memory_mapping(
 
 
 @torch.no_grad()
-def gen_code(model, args, output_dir=None, use_fake_mode=True):
+def gen_code(
+    model,
+    args,
+    output_dir=None,
+    use_fake_mode=True,
+    dump_parameters_only=False,
+):
     """Build legacy protobuf fields, then stream any requested real tensors.
 
     ``compile`` calls this after memory mapping with real example inputs. Dense
@@ -1481,10 +1488,20 @@ def gen_code(model, args, output_dir=None, use_fake_mode=True):
     subgraphs. Sparse callers can retain real propagation via ``use_fake_mode``.
     Resolve exact dump names while emitting fields, then execute real inputs
     once with bounded value retention. Return the protobuf with unchanged names,
-    logical dtypes, layouts, and memory annotations.
+    logical dtypes, layouts, and memory annotations, and the map from every
+    tensor file name to its path under ``output_dir`` (None without it).
+
+    By default every tensor file is written whole. ``dump_parameters_only``
+    writes only the get_attr tensors, whole, without executing other nodes,
+    and records them in ``DUMP_MANIFEST`` beside the files;
+    ``dump_tensor_regions`` can then add parts of the other tensors. A manifest
+    left in ``output_dir`` by an earlier dump is removed first.
     """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
+        manifest = os.path.join(output_dir, DUMP_MANIFEST)
+        if os.path.exists(manifest):
+            os.remove(manifest)
 
     named_modules = dict(model.named_modules(remove_duplicate=False))
 
@@ -1550,12 +1567,92 @@ def gen_code(model, args, output_dir=None, use_fake_mode=True):
 
         model_params.ops.append(op)
 
+    files = None
     if tensor_files is not None:
-        ShapeProp(model, tensor_files={
+        files = {
             name: os.path.join(output_dir, f"{name}.bin") for name in tensor_files
-        }).propagate(*args)
+        }
+        selected, regions = files, None
+        if dump_parameters_only:
+            selected, regions = _select_tensor_dumps(model, files, output_dir, True, None)
+        ShapeProp(model, tensor_files=selected, tensor_regions=regions).propagate(*args)
+        if regions is not None:
+            _record_tensor_dumps(output_dir, regions)
 
-    return model_params
+    return model_params, files
+
+
+@torch.no_grad()
+def dump_tensor_regions(model, args, output_dir, files, requests):
+    """Write requested parts of tensors after a parameters-only ``gen_code``.
+
+    ``files`` is the name-to-path map ``gen_code`` returned for ``output_dir``;
+    ``args`` are the same real inputs. ``requests`` maps tensor names to None
+    (whole) or a list of regions (see ``write_tensor_regions``); names the
+    manifest already lists as whole are skipped. Only the nodes the selected
+    tensors are computed from execute. Adds the written parts to
+    ``DUMP_MANIFEST``. ``compile`` calls this only for graphs that write no
+    tensor in place.
+    """
+    selected, regions = _select_tensor_dumps(model, files, output_dir, False, requests)
+    ShapeProp(model, tensor_files=selected, tensor_regions=regions).propagate(*args)
+    _record_tensor_dumps(output_dir, regions)
+
+
+# Written beside a partial tensor dump: maps each file's tensor name to "whole"
+# or to the list of regions the file holds (other bytes read as zeros).
+DUMP_MANIFEST = "dump_regions.json"
+
+
+def _read_dump_manifest(output_dir):
+    """Return the dump manifest in ``output_dir``, or {} if there is none."""
+    path = os.path.join(output_dir, DUMP_MANIFEST)
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _select_tensor_dumps(model, files, output_dir, parameters_only, requests):
+    """Return (files, regions) for a partial dump.
+
+    ``files`` maps every tensor name of the graph to its file. With
+    ``parameters_only`` the selection is every get_attr tensor, whole.
+    Otherwise it is each name of ``requests`` that the graph dumps and that the
+    manifest does not already list as whole; ``regions`` maps the selected
+    names to None (whole) or their region list.
+    """
+    if parameters_only:
+        attrs = {node.name for node in model.graph.nodes if node.op == "get_attr"}
+        selected = {name: None for name in files if name in attrs}
+    else:
+        written = _read_dump_manifest(output_dir)
+        selected = {
+            name: regions
+            for name, regions in requests.items()
+            if name in files and written.get(name) != "whole"
+        }
+        unknown = sorted(name for name in requests if name not in files)
+        if unknown:
+            logger.info(
+                f"{len(unknown)} requested tensor(s) are not dumped by this graph, "
+                f"for example {unknown[:5]}"
+            )
+    print(
+        f"[INFO] Writing {len(selected)} of {len(files)} tensor files "
+        f"({sum(regions is None for regions in selected.values())} whole)",
+        flush=True,
+    )
+    return {name: files[name] for name in selected}, selected
+
+
+def _record_tensor_dumps(output_dir, regions):
+    """Add the files of this partial dump to the manifest in ``output_dir``."""
+    manifest = _read_dump_manifest(output_dir)
+    for name, written in regions.items():
+        manifest[name] = "whole" if written is None else written
+    with open(os.path.join(output_dir, DUMP_MANIFEST), "w") as f:
+        json.dump(manifest, f, sort_keys=True)
 
 
 def gen_compute_graph(model, output_file="compute_graph", max_users=10):
