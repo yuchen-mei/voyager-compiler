@@ -101,8 +101,6 @@ def propagate_shape(node: Node, model: GraphModule = None):
     def load_arg(a):
         return map_arg(a, lambda n: getattr(n, "value", n.meta.get("val")))
 
-    modules = dict(model.named_modules()) if model is not None else {}
-
     if node.op == 'get_attr':
         result = fetch_attr(model, node.target)
     elif node.op in ('call_function', 'call_method', 'call_module'):
@@ -127,6 +125,7 @@ def propagate_shape(node: Node, model: GraphModule = None):
             self_obj, *args = args
             target = getattr(self_obj, node.target)
         else:
+            modules = dict(model.named_modules()) if model is not None else {}
             target = modules[node.target]
         with factory_mode if factory_mode is not None else nullcontext():
             result = target(*args, **kwargs)

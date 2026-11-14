@@ -481,8 +481,8 @@ def duplicate_shared_nodes(graph: torch.fx.Graph, nodes: List[Node]) -> List[Nod
     Returns:
         List[Node]: A new list where shared nodes have been duplicated.
     """
-    nodes_order = {node: idx for idx, node in enumerate(graph.nodes)}
-    nodes = sorted(nodes, key=lambda n: nodes_order[n])
+    # Nodes of one graph compare by their position in it.
+    nodes = sorted(nodes)
 
     for i in reversed(range(len(nodes) - 1)):
         node, next_node = nodes[i], nodes[i + 1]
@@ -1337,6 +1337,12 @@ def run_memory_mapping(
         copy_node.meta['dtype'] = node.meta.get('dtype', None)
         return copy_node
 
+    # Size in bytes and byte offset from the output start of every input of a
+    # stack/cat node, filled on first use. A stack input is only ever replaced
+    # by a copy of the same shape and dtype, so the lists stay valid.
+    stack_input_sizes = {}
+    stack_input_offsets = {}
+
     def allocate_for_stack_op(node: Node):
         """
         For stacked layers, place them next to each other so that we can read
@@ -1352,19 +1358,29 @@ def run_memory_mapping(
                 nodes[0] = create_copy_node(node, nodes[1])
 
             nodes = duplicate_shared_nodes(graph, nodes)
-            for n in nodes:
+            # The stack/cat node keeps its shape: its replaced inputs are
+            # copies of the same shape and dtype.
+            for n in nodes[:-1]:
                 propagate_shape(n, model)
 
             stack_node = nodes[-1]
             if (memory := stack_node.meta.get("memory", None)) is None:
                 memory = allocate_for_stack_op(stack_node)
 
-            tensor_sizes = [
-                n.value.numel() * get_node_bytes(n) for n in stack_node.args[0]
-            ]
+            if stack_node not in stack_input_sizes:
+                tensor_sizes = [
+                    n.value.numel() * get_node_bytes(n) for n in stack_node.args[0]
+                ]
+                offsets = [0]
+                for s in tensor_sizes[:-1]:
+                    offsets.append(offsets[-1] + s)
+                stack_input_sizes[stack_node] = tensor_sizes
+                stack_input_offsets[stack_node] = offsets
+            tensor_sizes = stack_input_sizes[stack_node]
+            offsets = stack_input_offsets[stack_node]
 
             index = stack_node.args[0].index(nodes[-2])
-            start_offset = memory.start + sum(tensor_sizes[:index])
+            start_offset = memory.start + offsets[index]
             size = tensor_sizes[index]
             segment = Segment(
                 start_offset, start_offset + size, allocator.memory_space
@@ -1386,7 +1402,7 @@ def run_memory_mapping(
                 for i in indices[1:]:
                     copy_node = create_copy_node(nodes[-2], stack_node)
                     tensors[i] = copy_node
-                    start_offset = memory.start + sum(tensor_sizes[:i])
+                    start_offset = memory.start + offsets[i]
                     copy_node.meta["memory"] = Segment(
                         start_offset, start_offset + size, allocator.memory_space
                     )

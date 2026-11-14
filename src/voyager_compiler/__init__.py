@@ -138,6 +138,7 @@ def transform(
     use_fake_mode=True,
     pad_terminal_output=True,
     materialize_broadcasts=True,
+    keep_batched_matmuls=False,
 ):
     """Lower a calibrated graph while retaining real sparse capacity analysis.
 
@@ -148,6 +149,9 @@ def transform(
     ``materialize_broadcasts`` rewrites expand into stacked memory copies and
     normalizes cat/stack for small graphs; a backend that reads a broadcast
     directly from its source passes False to keep expand as a view.
+    ``keep_batched_matmuls`` keeps a batched matmul whole when its operands
+    share every batch axis and only selects read it (see
+    ``split_multi_head_attention``), for a backend that tiles batch axes.
     """
     if example_kwargs is None:
         example_kwargs = {}
@@ -175,7 +179,7 @@ def transform(
     # primitives and handle memory copy/concat operations.
 
     share_mx_quantization_with_slices(model)
-    split_multi_head_attention(model)
+    split_multi_head_attention(model, keep_batched_matmuls)
 
     # TODO Disabled for large models. This will be removed in the future once
     # we can handle stack/cat using DMA properly.

@@ -591,7 +591,36 @@ def share_mx_quantization_with_slices(model: GraphModule):
     model.recompile()
 
 
-def split_multi_head_attention(model: GraphModule):
+def _keeps_batched_matmul(node: Node) -> bool:
+    """Return whether a batched MX matmul can stay one op instead of one per batch element.
+
+    True for a dense matmul_mx whose two operands have the same batch dims (no
+    batch axis is broadcast, so no rows merge) and whose result only selects
+    read. A backend that tiles its batch axes one element per tile then runs
+    the same per-element GEMMs the split would emit.
+    """
+    if (
+        node.target != torch.ops.quantized_ops.matmul_mx.default
+        or node.kwargs.get("A_data") is not None
+    ):
+        return False
+    input_shape = node.args[0].value.shape
+    other_shape = node.args[1].value.shape
+    return (
+        len(input_shape) > 2
+        and input_shape[:-2] == other_shape[:-2]
+        and all(user.target == torch.ops.aten.select.int for user in node.users)
+    )
+
+
+def split_multi_head_attention(model: GraphModule, keep_batched_matmuls=False):
+    """Split batched matmuls into one matmul per batch element.
+
+    A module's query-key and probability-value matmuls are split per head with
+    the ops between them copied per head; other batched matmuls are split with
+    rows merged where possible. With ``keep_batched_matmuls``, a matmul outside
+    such a pair that ``_keeps_batched_matmul`` accepts stays whole.
+    """
     graph = model.graph
 
     grouped_nodes = defaultdict(list)
@@ -609,6 +638,8 @@ def split_multi_head_attention(model: GraphModule):
     for nodes in grouped_nodes.values():
         if len(nodes) != 2:
             for node in nodes:
+                if keep_batched_matmuls and _keeps_batched_matmul(node):
+                    continue
                 output = _decompose_bmm_helper(model, node, merge_rows=True)
                 if output is not None:
                     _sink_broadcast_elementwise_into_bmm(model, output)
@@ -811,7 +842,7 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
             continue
 
         logger.info(f"Node {node} has different input shapes")
-        dim = node.args[1]
+        dim = get_arg_value(node, 1, "dim", 0)
 
         args = map_arg(node.args, lambda n: n.value)
         shape = list(args[0][0].shape[:dim])
