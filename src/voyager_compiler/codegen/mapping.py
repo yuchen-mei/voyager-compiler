@@ -1607,8 +1607,7 @@ def dump_tensor_regions(model, args, output_dir, files, requests):
     (whole) or a list of regions (see ``write_tensor_regions``); names the
     manifest already lists as whole are skipped. Only the nodes the selected
     tensors are computed from execute. Adds the written parts to
-    ``DUMP_MANIFEST``. ``compile`` calls this only for graphs that write no
-    tensor in place.
+    ``DUMP_MANIFEST``.
     """
     selected, regions = _select_tensor_dumps(model, files, output_dir, False, requests)
     ShapeProp(model, tensor_files=selected, tensor_regions=regions).propagate(*args)

@@ -2,7 +2,6 @@ from google.protobuf import text_format
 from torch.utils._pytree import tree_flatten
 
 from .codegen import *
-from .codegen.shape_prop import _writes_in_place
 from .decomposed import *
 from .compaction import *
 from .fake_quantize import *
@@ -286,10 +285,8 @@ def compile(
     regions (see ``dump_tensor_regions``). With it, ``gen_code`` writes only
     the parameter tensors, the function is called once model.txt and
     layers.txt are written, and the regions it returns are then written in
-    this process. Raises before code emission if ``dump_regions`` is set and a
-    graph op writes a tensor in place: the parameter dump would run those
-    writes, so the inputs and parameters would no longer hold their original
-    values for the region dump.
+    this process. The parameter dump runs no operation, so the region dump
+    starts from the same inputs and parameters as a dump of every tensor.
     Return the emitted Model protobuf and write the existing output artifacts.
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -330,11 +327,6 @@ def compile(
     if dump_snapshot:
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))
 
-    if dump_regions is not None and _writes_in_place(model):
-        raise ValueError(
-            "[ERROR] The graph writes a tensor in place, so its tensor regions "
-            "cannot be dumped after the parameters; dump every tensor instead"
-        )
     path = os.path.join(output_dir, "tensor_files")
     params, tensor_files = gen_code(
         model, flatten_args, path if dump_tensors else None,

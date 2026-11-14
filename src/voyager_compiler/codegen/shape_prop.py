@@ -240,8 +240,10 @@ class ShapeProp:
         A file name is a node name, or ``<node>_<i>`` for item i of a tuple
         result; both readings count when both exist. The set holds those nodes
         and every node they read, directly or indirectly. If any graph of the
-        module writes a tensor in place, it is every node up to the last
-        requested one in graph order.
+        module writes a tensor in place, it is the requested get_attr nodes and
+        every node up to the last other requested node in graph order. A
+        get_attr reads a module attribute and needs no other node, so a request
+        of only get_attr tensors runs no operation.
         """
         nodes = list(self.graph.nodes)
         by_name = {node.name: node for node in nodes}
@@ -256,13 +258,17 @@ class ShapeProp:
             targets.update(found)
         if _writes_in_place(self.mod):
             position = {node: i for i, node in enumerate(nodes)}
-            last = max((position[node] for node in targets), default=-1)
-            print(
-                "[INFO] The graph writes a tensor in place; executing every node "
-                "up to the last dumped tensor",
-                flush=True,
+            last = max(
+                (position[node] for node in targets if node.op != "get_attr"),
+                default=-1,
             )
-            return set(nodes[: last + 1])
+            if last >= 0:
+                print(
+                    "[INFO] The graph writes a tensor in place; executing every "
+                    "node up to the last dumped tensor",
+                    flush=True,
+                )
+            return targets | set(nodes[: last + 1])
         needed = set()
         stack = list(targets)
         while stack:
