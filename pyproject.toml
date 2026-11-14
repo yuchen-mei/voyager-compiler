@@ -15,7 +15,10 @@ requires-python = ">=3.10"
 # STABILITY FIRST: Exact versions enforced where critical.
 dependencies = [
     "accelerate==1.12.0",
-    "av==18.1.0",
+    # PyAV decodes the Video-MME videos, which runs on Python 3.11 or newer.
+    # PyAV 18 has no Python 3.10 release, and Voyager's Python 3.10 conda
+    # environment for the MatrixUnit HLS flow does not decode video.
+    "av==18.1.0; python_version >= '3.11'",
     "datasets==4.5.0",
     "evaluate",
     "graphviz",
