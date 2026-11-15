@@ -1308,11 +1308,20 @@ def run_memory_mapping(
         node.meta["scratchpad_map"] = scratchpad_map
 
     def get_path_to_target(node: torch.fx.Node, targets):
+        """Find an output that can share contiguous leading-axis storage.
+
+        Memory allocation uses this path to place inputs beside one another.
+        Concat on an inner axis instead interleaves those inputs by row, so
+        it needs a separate output allocation and an executed copy/DMA.
+        """
         if not isinstance(targets, (list, tuple)):
             targets = [targets]
 
         for user in node.users:
             if user.target in targets:
+                dim = get_arg_value(user, 1, "dim", 0)
+                if dim % len(user.value.shape) != 0:
+                    continue
                 return [node, user]
 
             if is_nop(user):
@@ -1461,13 +1470,15 @@ def run_memory_mapping(
             skip_allocation = True
 
         # We use the partition of the first input tensor since it preallocates
-        # memory for all the tensors in the stack operation
+        # memory for a leading-axis stack/concat. Inner-axis copies instead
+        # allocate their output below; no input can preallocate its row layout.
         if node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
-            if node.args[1] == 0 and node.meta.get("memory") is not None:
+            dim = get_arg_value(node, 1, "dim", 0) % len(node.value.shape)
+            if dim == 0 and node.meta.get("memory") is not None:
                 continue
 
-            if node.meta.get("memory") is None:
-                logger.warning(f"WARNING: stack node {node} does not have memory allocated")
+            if dim == 0 and node.meta.get("memory") is None:
+                logger.warning(f"[WARNING] stack node {node} does not have memory allocated")
 
         allocate_for_stack_op(node)
 
