@@ -893,10 +893,61 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
     Move quantize and dequantize nodes up the graph and place them after the
     previous operation (e.g. matmul, conv2d, etc.), so that the quantize and
     dequantize can be fused with the previous operation.
+
+    Transform calls this after attention splitting. Last-axis MX quantization
+    may cross a reshape when both last dimensions contain complete MX blocks:
+    the same contiguous values retain the same block scales. Reshape its scale
+    and payload outputs separately so a fused GEMM can tile output channels
+    without executing a fixed full-head reshape on a smaller operand tile.
     """
     from .pt2e_utils import propagate_shape
 
     graph = model.graph
+
+    for node in list(graph.nodes):
+        if node.target != torch.ops.quantized_ops.quantize_mx.default:
+            continue
+        reshaped = node.args[0]
+        if reshaped.target not in (
+            torch.ops.aten.reshape.default,
+            torch.ops.aten.view.default,
+            torch.ops.aten._unsafe_view.default,
+        ):
+            continue
+        original = reshaped.args[0]
+        axes = get_arg_value(node, 2, "axes")
+        block_size = get_arg_value(node, 3, "block_size")
+        if (
+            list(axes) not in ([-1], [len(reshaped.value.shape) - 1])
+            or original.value.shape[-1] % block_size
+            or reshaped.value.shape[-1] % block_size
+            or any(
+                user.target != operator.getitem or user.args[1] not in (0, 1)
+                for user in node.users
+            )
+        ):
+            continue
+        # Blocks keep their row-major order. Only the leading shapes of the
+        # payload and one-scale-per-block tensor need to follow the old view.
+        old_shapes = {user: tuple(user.value.shape) for user in node.users}
+        node.update_arg(0, original)
+        if len(node.args) > 2:
+            node.update_arg(2, (-1,))
+        else:
+            node.update_kwarg("axes", (-1,))
+        propagate_shape(node, model)
+        for item, shape in old_shapes.items():
+            old_users = list(item.users)
+            old_meta = dict(item.meta)
+            propagate_shape(item, model)
+            with graph.inserting_after(item):
+                view = graph.call_function(
+                    torch.ops.aten.reshape.default, (item, shape)
+                )
+            view.meta.update(old_meta)
+            propagate_shape(view, model)
+            for user in old_users:
+                user.replace_input_with(item, view)
 
     def find_prev_op_and_move_node(node, prev_node=None, curr_node=None):
         nodes_on_path = []
